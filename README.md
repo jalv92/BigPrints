@@ -1,6 +1,9 @@
 # BigPrints
 
-NinjaTrader 8 indicator that flags large aggressive market orders (buy/sell sweeps) on the Level 1 tape and marks them on the chart at the exact price they printed, with the swept contract count.
+NinjaTrader 8 indicator + strategy pair built on large aggressive market orders (buy/sell sweeps) detected from the Level 1 tape.
+
+- **BigPrints.cs** (indicator) — marks each sweep on the chart at the exact price it printed, with the swept contract count and a sound alert.
+- **BigPrintsStrategy.cs** (strategy) — trades in the aggressor's direction: enters on a qualifying sweep, reverses in one step when an opposite sweep fires mid-trade, governed by a session window and daily profit/loss limits in USD. **No per-trade stop in v1** — daily limits only. Real-time / Market Replay only; cannot be backtested in the Strategy Analyzer (no historical tape).
 
 Built for ES futures; works on any instrument with a live tape.
 
