@@ -15,7 +15,15 @@ using NinjaTrader.NinjaScript;
 // Series a strategy could read via indicator[0], so the detection logic below is a duplicate,
 // trimmed to what trading needs (no draw-anchor price/time tracking, no per-cluster labeling).
 // BigPrints.cs remains the reference implementation — if the clustering rules change there,
-// mirror the change here too.
+// mirror the change here too. One deliberate divergence: this strategy finalizes a cluster on
+// TAPE-QUOTE TIMEOUT (any Bid/Ask/Last event more than ClusterMilliseconds after the cluster's
+// last print — see OnMarketData) for lower entry latency, since a completed sweep often isn't
+// followed by another Last print for a while. BigPrints.cs the indicator still waits for the
+// next breaking print to finalize and draw — fine there, since a marker showing up a beat late
+// is cosmetic, but unacceptable for an entry signal. Bar clocks (Time[0]) must NEVER drive
+// cluster lifecycle — on a time-based chart Time[0] of the developing bar is a FUTURE timestamp
+// (the bar's eventual close), so comparing it against a tick time overstates elapsed time by the
+// remainder of the bar and destroys every cluster before it can finalize.
 //
 // REAL-TIME / MARKET REPLAY ONLY. OnMarketData does not fire on historical data, so this
 // strategy CANNOT be backtested or optimized in the Strategy Analyzer — there is no historical
@@ -152,11 +160,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _lastResetBar = CurrentBar;
             }
 
-            // Stale-cluster hygiene: if the tape went quiet mid-sweep, discard the open cluster
-            // once it's clearly done (wall-clock gap since its last print exceeds the hard span
-            // cap) rather than let it linger and merge with an unrelated print far later.
-            if (_clusterOpen && (Time[0] - _clusterLastTime).TotalMilliseconds > MaxClusterSpanMs)
-                _clusterOpen = false;
+            // ponytail: cluster lifecycle is driven entirely by tape-clock timeouts inside
+            // OnMarketData (see header comment) — no bar-clock cluster hygiene belongs here.
 
             PollAtmState();
             CheckRiskGovernor();
@@ -175,12 +180,38 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             MarketPosition atmPos = GetAtmStrategyMarketPosition(_atmStrategyId);
 
+            // Deadlock guard: an entry order that dies AFTER AtmStrategyCreate() succeeded (margin
+            // rejection, manual cancel, Day-TIF expiry) never produces a position, so the fill-
+            // confirmation branch below would never fire and _orderPending would stay true forever
+            // — silently locking the strategy out of the market for the rest of the session.
+            // Gated on atmPos still Flat: a partial fill that then gets cancelled DOES have a real
+            // position, and that case is correctly handled as a fill below, not a dead order here.
+            if (_atmPending && atmPos == MarketPosition.Flat)
+            {
+                string[] status = GetAtmStrategyEntryOrderStatus(_atmOrderId); // empty until the order registers
+                if (status.Length == 3 &&
+                    (string.Equals(status[2], "Rejected", StringComparison.OrdinalIgnoreCase) ||
+                     string.Equals(status[2], "Cancelled", StringComparison.OrdinalIgnoreCase)))
+                {
+                    Print(string.Format("[BigPrints] ATM entry order {0} — resetting, ready for the next signal.", status[2]));
+                    _atmPending      = false;
+                    _atmPositionOpen = false;
+                    _atmClosing      = false;
+                    _atmReverseToBuy = null;
+                    _atmStrategyId   = string.Empty;
+                    _atmOrderId      = string.Empty;
+                    _orderPending    = false;
+                    return;
+                }
+            }
+
             if (_atmPending && atmPos != MarketPosition.Flat)
             {
                 // Entry confirmed filled.
                 _atmPending      = false;
                 _atmPositionOpen = true;
                 _orderPending    = false;
+                Print(string.Format("[BigPrints] ATM entry fill confirmed. Position={0}", atmPos));
             }
 
             if ((_atmPositionOpen || _atmClosing) && atmPos == MarketPosition.Flat)
@@ -199,9 +230,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _atmReverseToBuy = null;
 
                 if (reverseTo.HasValue)
+                {
+                    Print(string.Format("[BigPrints] ATM reversal: close confirmed, firing second leg ({0}).",
+                        reverseTo.Value ? "BUY" : "SELL"));
                     CreateAtm(reverseTo.Value); // re-sets _atmPending/_orderPending for the new leg
+                }
                 else
+                {
                     _orderPending = false;
+                }
             }
         }
 
@@ -287,6 +324,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     _atmClosing      = true;
                     _atmReverseToBuy = null; // plain flatten — no reversal queued behind this close
                     _orderPending    = true;
+                    Print(string.Format("[BigPrints] ATM close submitted: flatten ({0})", signalName));
                     AtmStrategyClose(_atmStrategyId);
                 }
                 return;
@@ -323,6 +361,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (CurrentBar < 0 || State != State.Realtime)
                 return;
+
+            // Tape-clock timeout: quotes keep flowing even when prints pause, so ANY event type
+            // (Bid/Ask/Last) more than ClusterMilliseconds after the cluster's last print is the
+            // silence-breaker that finalizes it — lower latency than waiting for the next Last
+            // print to break it. No double-finalize risk: FinalizeCluster sets _clusterOpen=false,
+            // so if this tick IS itself a same-side Last print continuing the sweep, the block
+            // below simply won't see an open cluster to fold into and starts a fresh one instead.
+            if (_clusterOpen && (e.Time - _clusterLastTime).TotalMilliseconds > ClusterMilliseconds)
+                FinalizeCluster(e.Time);
 
             if (e.MarketDataType == MarketDataType.Bid)
             {
@@ -386,11 +433,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_clusterVolume < MinVolume)
                 return;
 
+            Print(string.Format("[BigPrints] Cluster {0} {1} contracts @ {2:HH:mm:ss.fff}",
+                _clusterIsBuy ? "BUY" : "SELL", _clusterVolume, now));
+
             // Cold signal — the cluster's last print is too far behind "now" to still be
-            // actionable (tape went quiet, or this finalize was only triggered by a much later
-            // unrelated tick). Drop it rather than trade a stale sweep.
+            // actionable. With the tape-clock timeout in OnMarketData now finalizing clusters
+            // within ~ClusterMilliseconds of their real end, this only fires if the ENTIRE tape
+            // (quotes included) went silent for 2s+ — a genuinely dead market, where skipping is right.
             if ((now - _clusterLastTime).TotalMilliseconds > 2000)
+            {
+                Print("[BigPrints] Cluster not traded: cold signal (tape silent 2s+ since the cluster's last print).");
                 return;
+            }
 
             TryEnter(_clusterIsBuy, now);
         }
@@ -405,8 +459,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         // gets its stop/target from the template instead (see AtmTemplateName).
         private void TryEnter(bool isBuy, DateTime marketTime)
         {
-            if (_orderPending || _dailyLockout || !InSession(marketTime))
+            if (_orderPending)
+            {
+                Print("[BigPrints] Cluster not traded: an order/ATM operation is already pending.");
                 return;
+            }
+            if (_dailyLockout)
+            {
+                Print("[BigPrints] Cluster not traded: daily lockout active.");
+                return;
+            }
+            if (!InSession(marketTime))
+            {
+                Print("[BigPrints] Cluster not traded: outside the session window.");
+                return;
+            }
 
             if (IsAtmMode)
                 TryEnterAtm(isBuy);
@@ -426,16 +493,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (isBuy) EnterLong(Contracts, "BigPrintLong");
                 else       EnterShort(Contracts, "BigPrintShort");
                 _orderPending = true;
+                Print(string.Format("[BigPrints] Native entry submitted: {0} x{1}", isBuy ? "BUY" : "SELL", Contracts));
             }
             else if (pos == MarketPosition.Long && !isBuy)
             {
                 EnterShort(Contracts, "BigPrintShort");
                 _orderPending = true;
+                Print(string.Format("[BigPrints] Native reversal submitted: SELL x{0}", Contracts));
             }
             else if (pos == MarketPosition.Short && isBuy)
             {
                 EnterLong(Contracts, "BigPrintLong");
                 _orderPending = true;
+                Print(string.Format("[BigPrints] Native reversal submitted: BUY x{0}", Contracts));
             }
             // else: same-direction cluster while already positioned — stay in, do nothing.
         }
@@ -458,6 +528,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _atmClosing      = true;
                 _atmReverseToBuy = isBuy;
                 _orderPending    = true;
+                Print(string.Format("[BigPrints] ATM close submitted: reversal to {0}", isBuy ? "BUY" : "SELL"));
                 AtmStrategyClose(_atmStrategyId);
             }
             // else: same-direction cluster while already positioned — stay in, do nothing.
@@ -474,6 +545,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             _orderPending  = true;
 
             string thisAtmId = _atmStrategyId; // capture — a reversal can overwrite the field before this fires
+
+            Print(string.Format("[BigPrints] ATM create submitted: {0} | Template={1}", isBuy ? "BUY" : "SELL", AtmTemplateName));
 
             AtmStrategyCreate(
                 isBuy ? OrderAction.Buy : OrderAction.SellShort,
