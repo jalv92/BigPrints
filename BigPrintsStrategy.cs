@@ -138,6 +138,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
         private readonly List<AggressionRecord> _aggressionLedger = new List<AggressionRecord>();
 
+        // Trade cooldown (feature: gates fresh entries from flat only, never reversals). Tape
+        // time only — hard rule in this file, never Time[0]/DateTime.Now.
+        private DateTime _lastTapeTime;  // updated on every OnMarketData event, all three types
+        private DateTime _lastFlatTime;  // when the position last closed; MinValue = no trade yet
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -165,6 +170,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ProfitTargetTicks    = 0;     // 0 = disabled
                 AggressionWindowSeconds = 180;
                 ReversalDominanceRatio  = 1.5;
+                CooldownMinutes         = 5;
             }
             else if (State == State.Configure)
             {
@@ -203,6 +209,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _signalVolume     = 0;
                 _signalTime       = default(DateTime);
                 _aggressionLedger.Clear();
+                _lastTapeTime     = DateTime.MinValue;
+                _lastFlatTime     = DateTime.MinValue; // no trade yet -> no cooldown
 
                 _atmStrategyId       = string.Empty;
                 _atmOrderId          = string.Empty;
@@ -246,7 +254,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Ledger BEFORE the gates in TryEnter — a signal that gets skipped (pending/
                 // lockout/session) is still real tape flow for the reversal dominance filter.
                 RecordAggression(_signalIsBuy, _signalVolume, _signalTime);
-                TryEnter(_signalIsBuy, _signalTime);
+                TryEnter(_signalIsBuy, _signalVolume, _signalTime);
             }
         }
 
@@ -351,6 +359,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double realized = 0;
                 try { realized = GetAtmStrategyRealizedProfitLoss(_atmStrategyId); } catch { }
                 _atmRealizedPnLToday += realized;
+
+                // Cooldown clock: no per-fill tape time available here (ATM doesn't report one),
+                // so the freshest known tape time is the correct stand-in — never Time[0]/Now.
+                _lastFlatTime = _lastTapeTime;
 
                 _atmPositionOpen = false;
                 _atmStrategyId   = string.Empty;
@@ -506,6 +518,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar < 0 || State != State.Realtime)
                 return;
 
+            // Freshest tape time, for every event type — used by PollAtmState to timestamp an
+            // ATM flat-transition it detects without a per-fill time of its own (see cooldown).
+            _lastTapeTime = e.Time;
+
             // Tape-clock timeout: quotes keep flowing even when prints pause, so ANY event type
             // (Bid/Ask/Last) more than ClusterMilliseconds after the cluster's last print is the
             // silence-breaker that finalizes it — lower latency than waiting for the next Last
@@ -606,7 +622,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // governor above). To add one later: call SetStopLoss/SetProfitTarget right after each
         // EnterLong/EnterShort call in TryEnterNative, tied to the same signal name. ATM mode
         // gets its stop/target from the template instead (see AtmTemplateName).
-        private void TryEnter(bool isBuy, DateTime marketTime)
+        private void TryEnter(bool isBuy, long volume, DateTime marketTime)
         {
             if (_orderPending)
             {
@@ -625,21 +641,43 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             if (IsAtmMode)
-                TryEnterAtm(isBuy, marketTime);
+                TryEnterAtm(isBuy, volume, marketTime);
             else
-                TryEnterNative(isBuy, marketTime);
+                TryEnterNative(isBuy, volume, marketTime);
+        }
+
+        // Cooldown gate — fresh entries from flat ONLY; reversals are exempt (governed by the
+        // aggression-balance filter instead), and so is the ATM reversal second leg (fired
+        // directly from PollAtmState via CreateAtm, bypassing this method entirely). Tape time
+        // only — hard rule in this file, never Time[0]/DateTime.Now.
+        private bool PassesCooldown(bool isBuy, long volume, DateTime now)
+        {
+            if (CooldownMinutes <= 0 || _lastFlatTime == DateTime.MinValue)
+                return true;
+
+            double elapsedMin = (now - _lastFlatTime).TotalMinutes;
+            if (elapsedMin >= CooldownMinutes)
+                return true;
+
+            int remainingSec = (int)Math.Ceiling((CooldownMinutes - elapsedMin) * 60.0);
+            Print(string.Format("[BigPrints] Signal {0} {1} skipped (cooldown, {2}s remaining)",
+                isBuy ? "BUY" : "SELL", volume, remainingSec));
+            return false;
         }
 
         // NATIVE mode: EnterLong/EnterShort while in the opposite position reverses in one
         // managed-approach order (close + open), per NT8's documented Entry() reversal behavior
-        // — no separate Exit() call needed. The reversal branches are gated by the aggression-
-        // balance filter (feature 2); the flat-entry branch is never filtered.
-        private void TryEnterNative(bool isBuy, DateTime now)
+        // — no separate Exit() call needed. Reversal branches are gated by the aggression-balance
+        // filter (feature 2); the flat-entry branch is gated by the cooldown instead (never both).
+        private void TryEnterNative(bool isBuy, long volume, DateTime now)
         {
             MarketPosition pos = Position.MarketPosition;
 
             if (pos == MarketPosition.Flat)
             {
+                if (!PassesCooldown(isBuy, volume, now))
+                    return; // consumed — not queued for later
+
                 if (isBuy) EnterLong(Contracts, "BigPrintLong");
                 else       EnterShort(Contracts, "BigPrintShort");
                 _orderPending = true;
@@ -668,9 +706,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ATM mode: reversal is two async steps (unlike native's single-order reverse) — close
         // the live ATM, then create the opposite one once PollAtmState() confirms it's flat.
-        // _atmReverseToBuy carries the queued direction across that gap. The reversal branches
-        // are gated by the aggression-balance filter (feature 2); flat-entry is never filtered.
-        private void TryEnterAtm(bool isBuy, DateTime now)
+        // _atmReverseToBuy carries the queued direction across that gap. Reversal branches are
+        // gated by the aggression-balance filter (feature 2); the flat-entry branch is gated by
+        // the cooldown instead (never both — a reversal is exempt from cooldown by design).
+        private void TryEnterAtm(bool isBuy, long volume, DateTime now)
         {
             MarketPosition atmPos;
             if (string.IsNullOrEmpty(_atmStrategyId))
@@ -687,6 +726,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (atmPos == MarketPosition.Flat)
             {
+                if (!PassesCooldown(isBuy, volume, now))
+                    return; // consumed — not queued for later
+
                 CreateAtm(isBuy);
             }
             else if (atmPos == MarketPosition.Long && !isBuy)
@@ -767,7 +809,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             OrderState state = execution.Order.OrderState;
             if (state == OrderState.Filled || state == OrderState.Cancelled || state == OrderState.Rejected)
+            {
                 _orderPending = false;
+
+                // Cooldown clock: this fires on any terminal fill for this strategy — entry OR a
+                // bracket exit (stop/target) — so a flat check here correctly captures a bracket
+                // close too, using the real execution time (tape time), not Time[0]/DateTime.Now.
+                if (Position.MarketPosition == MarketPosition.Flat)
+                    _lastFlatTime = time;
+            }
         }
 
         #region Properties
@@ -829,6 +879,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(1, 10)]
         [Display(Name = "Reversal Dominance Ratio", Description = "A reversal only fires if the new side's windowed volume is at least this many times the held side's — filters a lone counter-signal out of a two-sided battle.", Order = 12, GroupName = "Parameters")]
         public double ReversalDominanceRatio { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 240)]
+        [Display(Name = "Trade Cooldown (min)", Description = "Minimum rest after a trade closes before a NEW entry from flat is allowed. 0 = disabled. Does NOT block reversals.", Order = 13, GroupName = "Parameters")]
+        public int CooldownMinutes { get; set; }
         #endregion
     }
 }
