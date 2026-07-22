@@ -42,6 +42,13 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private int _tagCounter;
 
+        // Per-side label stacking: how many clusters already labeled THIS bar on this side, so a
+        // second/third same-bar same-side cluster stacks further away instead of overlapping.
+        private int _buyStackBar   = -1;
+        private int _buyStackCount;
+        private int _sellStackBar  = -1;
+        private int _sellStackCount;
+
         // ponytail: hard cap on live draw objects — a slow steady same-side drip (prints every
         // ~150ms for minutes) would otherwise merge into one giant blob AND draw objects are
         // never removed, so chart memory grows without bound over a session. 400 clusters is
@@ -202,8 +209,29 @@ namespace NinjaTrader.NinjaScript.Indicators
                 // CurrentBar >= 0 is already guaranteed by the OnMarketData guard that led here.
                 double textY = _clusterIsBuy ? Low[0] - tickOffset : High[0] + tickOffset;
 
+                // Stack same-bar same-side labels apart in screen pixels (scale-independent).
+                // Chart pixel Y grows downward, so a positive yPixelOffset pushes further DOWN
+                // (away from the low, correct for buys) and a negative one pushes further UP
+                // (away from the high, correct for sells). First cluster on a bar = index 0 = no
+                // offset = closest to the candle; each later same-bar same-side cluster stacks
+                // one step further out, so reading order (near-to-far) is arrival order.
+                int stackIndex;
+                if (_clusterIsBuy)
+                {
+                    stackIndex = (CurrentBar == _buyStackBar) ? ++_buyStackCount : (_buyStackCount = 0);
+                    _buyStackBar = CurrentBar;
+                }
+                else
+                {
+                    stackIndex = (CurrentBar == _sellStackBar) ? ++_sellStackCount : (_sellStackCount = 0);
+                    _sellStackBar = CurrentBar;
+                }
+                int pixelOffset = _clusterIsBuy
+                    ? stackIndex * (TextSize + 8)
+                    : -stackIndex * (TextSize + 8);
+
                 Draw.Dot(this, dotTag, false, _clusterMaxTime, _clusterPrice, dotBrush);
-                Draw.Text(this, textTag, false, _clusterVolume.ToString(), _clusterMaxTime, textY, 0,
+                Draw.Text(this, textTag, false, _clusterVolume.ToString(), _clusterMaxTime, textY, pixelOffset,
                     dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, dotBrush, Brushes.Black, 70);
 
                 // Sound only on the live path — no audio alert firing during Terminated teardown.
