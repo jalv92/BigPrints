@@ -22,6 +22,14 @@ using NinjaTrader.NinjaScript.DrawingTools;
 // default), so this indicator shows nothing on a historical chart load — only prints
 // that occur while the chart is live or replaying. No historical reconstruction is
 // attempted; that is out of scope by design (see nt8-indicator: onmarketdata caveats).
+//
+// PLAYBACK ADVISORY (2026-07-21/22): under accelerated Playback, rapid overlapping PlaySound
+// instances are implicated in NT8 native (ucrtbase) crashes — NT8's PlaySound uses NAudio's
+// AudioFileReader + WaveOutEvent, which runs OVERLAPPING async instances by default (NAudio has
+// documented native crashes from concurrent WaveOutEvent use). Our WAVs are ~0.32-0.34s; in a
+// fast Playback session, buy AND sell clusters can fire within that window, guaranteeing overlap.
+// SoundCooldownMs below throttles PlaySound to prevent that overlap. Users can additionally
+// enable Tools > Options > Sounds > "Play consecutively" to force NT8's own serialized sound queue.
 namespace NinjaTrader.NinjaScript.Indicators
 {
     public class BigPrints : Indicator
@@ -60,6 +68,20 @@ namespace NinjaTrader.NinjaScript.Indicators
         private Brush _buyBrush  = Brushes.Lime;
         private Brush _sellBrush = Brushes.Red;
 
+        // Sound-overlap throttle (see PLAYBACK ADVISORY above). Shared across buy AND sell — a
+        // buy chirp still playing when a sell fires is still two overlapping native audio
+        // instances, so one counter gates both sides, not per-side counters.
+        //
+        // CLOCK NUANCE: this deliberately uses REAL wall-clock time (Environment.TickCount),
+        // not tape time (e.Time) like the rest of this file. Audio overlap is a physical
+        // real-time phenomenon — in accelerated Playback, tape time runs faster than real time,
+        // so a tape-time cooldown would still let two PlaySound calls land within the same real
+        // audio-device window. This is the one legitimate exception to "tape time only" here.
+        // int, not long: NT8 targets .NET Framework 4.8, which has no TickCount64. Plain int
+        // TickCount wraps every ~24.9 days; `unchecked` subtraction below is wrap-safe as long
+        // as the gap between two reads is under that span — always true for a sub-10s cooldown.
+        private int _lastSoundTick;
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -78,6 +100,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 EnableSound         = true;
                 BuySoundFile        = "BigPrintBuy.wav";
                 SellSoundFile       = "BigPrintSell.wav";
+                SoundCooldownMs     = 750; // > the ~340ms WAV length, guarantees no overlap
             }
             else if (State == State.Configure)
             {
@@ -235,14 +258,24 @@ namespace NinjaTrader.NinjaScript.Indicators
                     dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, dotBrush, Brushes.Black, 70);
 
                 // Sound only on the live path — no audio alert firing during Terminated teardown.
+                // Throttled by real wall-clock time (see _lastSoundTick field comment) to prevent
+                // overlapping native PlaySound instances — a skip here is silent (no Print): it
+                // fires often in fast Playback and the dot/label above already drew regardless.
                 if (EnableSound)
                 {
-                    string soundFile = _clusterIsBuy ? BuySoundFile : SellSoundFile;
-                    // Fully qualified (not a `using System.IO;`) — NinjaTrader.Gui brings its own
-                    // Path type into scope, and a bare "Path" here would collide with it.
-                    string fullPath = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "sounds", soundFile);
-                    if (System.IO.File.Exists(fullPath))
-                        PlaySound(fullPath);
+                    int nowTick = Environment.TickCount;
+                    if (unchecked(nowTick - _lastSoundTick) >= SoundCooldownMs)
+                    {
+                        string soundFile = _clusterIsBuy ? BuySoundFile : SellSoundFile;
+                        // Fully qualified (not a `using System.IO;`) — NinjaTrader.Gui brings its own
+                        // Path type into scope, and a bare "Path" here would collide with it.
+                        string fullPath = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "sounds", soundFile);
+                        if (System.IO.File.Exists(fullPath))
+                        {
+                            PlaySound(fullPath);
+                            _lastSoundTick = nowTick;
+                        }
+                    }
                 }
             }
 
@@ -288,8 +321,13 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Display(Name = "Sell Sound File", Description = "WAV file name (in the NinjaTrader 8 sounds folder) played on a sell cluster.", Order = 7, GroupName = "Parameters")]
         public string SellSoundFile { get; set; }
 
+        [NinjaScriptProperty]
+        [Range(0, 10000)]
+        [Display(Name = "Sound Cooldown (ms)", Description = "Minimum real-time between alert sounds; prevents overlapping native audio instances which can destabilize NT8 in accelerated Playback. 750ms > the 340ms WAV length guarantees no overlap.", Order = 8, GroupName = "Parameters")]
+        public int SoundCooldownMs { get; set; }
+
         [XmlIgnore]
-        [Display(Name = "Buy Brush", Description = "Color for buy-aggressor clusters.", Order = 8, GroupName = "Parameters")]
+        [Display(Name = "Buy Brush", Description = "Color for buy-aggressor clusters.", Order = 9, GroupName = "Parameters")]
         public Brush BuyBrush
         {
             get { return _buyBrush; }
@@ -304,7 +342,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         [XmlIgnore]
-        [Display(Name = "Sell Brush", Description = "Color for sell-aggressor clusters.", Order = 9, GroupName = "Parameters")]
+        [Display(Name = "Sell Brush", Description = "Color for sell-aggressor clusters.", Order = 10, GroupName = "Parameters")]
         public Brush SellBrush
         {
             get { return _sellBrush; }
