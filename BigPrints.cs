@@ -67,6 +67,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                 MinVolume           = 150;
                 ClusterMilliseconds = 150;
                 TextSize            = 14;
+                TextOffsetTicks     = 10;
             }
             else if (State == State.Configure)
             {
@@ -165,26 +166,42 @@ namespace NinjaTrader.NinjaScript.Indicators
             string textTag = "BigPrintText" + _tagCounter;
 
             Brush dotBrush = _clusterIsBuy ? _buyBrush : _sellBrush;
-            double offset  = 4 * TickSize;
-            double textY   = _clusterIsBuy ? _clusterPrice + offset : _clusterPrice - offset;
+            double tickOffset = TextOffsetTicks * TickSize;
 
-            // Anchor at the largest print's own price AND time — not the cluster's last print time,
-            // which can be a different (smaller) print later in the same sweep.
+            // Dot stays glued to the exact print: (_clusterMaxTime, _clusterPrice) — the precise
+            // signal, never moved. Text is pushed clear of price action (arrow-indicator style,
+            // below the low for buys / above the high for sells) so it never overlaps a candle;
+            // color alone ties the label back to its dot (no connector line — not worth it).
             if (bestEffort)
             {
                 try
                 {
+                    double textY;
+                    try
+                    {
+                        textY = _clusterIsBuy ? Low[0] - tickOffset : High[0] + tickOffset;
+                    }
+                    catch (Exception)
+                    {
+                        // Bar series can be invalid on the Terminated teardown thread — fall back
+                        // to an offset from the print price itself.
+                        textY = _clusterIsBuy ? _clusterPrice - tickOffset : _clusterPrice + tickOffset;
+                    }
+
                     Draw.Dot(this, dotTag, false, _clusterMaxTime, _clusterPrice, dotBrush);
                     Draw.Text(this, textTag, false, _clusterVolume.ToString(), _clusterMaxTime, textY, 0,
-                        dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, null, null, 0);
+                        dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, dotBrush, Brushes.Black, 70);
                 }
                 catch (Exception) { /* teardown thread — chart may already be gone, nothing to do */ }
             }
             else
             {
+                // CurrentBar >= 0 is already guaranteed by the OnMarketData guard that led here.
+                double textY = _clusterIsBuy ? Low[0] - tickOffset : High[0] + tickOffset;
+
                 Draw.Dot(this, dotTag, false, _clusterMaxTime, _clusterPrice, dotBrush);
                 Draw.Text(this, textTag, false, _clusterVolume.ToString(), _clusterMaxTime, textY, 0,
-                    dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, null, null, 0);
+                    dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, dotBrush, Brushes.Black, 70);
             }
 
             _drawnClusterTags.Enqueue(_tagCounter);
@@ -212,8 +229,13 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Display(Name = "Text Size", Description = "Font size of the contract-count label.", Order = 3, GroupName = "Parameters")]
         public int TextSize { get; set; }
 
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name = "Text Offset Ticks", Description = "Ticks between the current bar's high/low and the contract-count label.", Order = 4, GroupName = "Parameters")]
+        public int TextOffsetTicks { get; set; }
+
         [XmlIgnore]
-        [Display(Name = "Buy Brush", Description = "Color for buy-aggressor clusters.", Order = 4, GroupName = "Parameters")]
+        [Display(Name = "Buy Brush", Description = "Color for buy-aggressor clusters.", Order = 5, GroupName = "Parameters")]
         public Brush BuyBrush
         {
             get { return _buyBrush; }
@@ -228,7 +250,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         [XmlIgnore]
-        [Display(Name = "Sell Brush", Description = "Color for sell-aggressor clusters.", Order = 5, GroupName = "Parameters")]
+        [Display(Name = "Sell Brush", Description = "Color for sell-aggressor clusters.", Order = 6, GroupName = "Parameters")]
         public Brush SellBrush
         {
             get { return _sellBrush; }
