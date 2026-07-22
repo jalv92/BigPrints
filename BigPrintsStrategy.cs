@@ -42,6 +42,17 @@ using NinjaTrader.NinjaScript;
 //     strategy's chart position/PnL display will NOT reflect it. Use GetAtmStrategyMarketPosition
 //     / the ATM's own reporting to see the real state.
 //
+// THREADING: order submissions are deliberately marshalled from OnMarketData onto the strategy
+// thread (OnBarUpdate) via a one-slot signal queue (_signalQueued/_signalIsBuy/_signalTime),
+// NOT submitted directly from OnMarketData. Calling AtmStrategyCreate/EnterLong straight off the
+// market-data thread crashed NT8 twice in Playback on 2026-07-21 (crash dumps 22:57 and 23:04,
+// trace ending in NT8's internal "SQLite error (21): bind on a busy prepared statement" on the
+// Strategy2Order association write) — submitting orders while the ATM engine's own Stop1/Target1
+// bracket creation lands within milliseconds on a different thread hits a thread-safety bug in
+// NT8's internal DB layer. Every NT8 sample (SampleAtmStrategy, TBStrategy) submits from
+// OnBarUpdate for the same reason. OnMarketData must stay purely computational — read/compute
+// only, zero Enter*/AtmStrategy*/Exit* calls — forever. Latency cost of the queue is <= 1 tick.
+//
 // LIVE-MONEY GATE (not fixed in v1 by design) — read before enabling on a funded account:
 //   - No per-trade stop loss in NATIVE mode; only the daily USD governor (target/loss) bounds
 //     risk there. This is SOLVED in ATM mode — use an ATM template with a real stop.
@@ -93,6 +104,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private bool IsAtmMode => !string.IsNullOrEmpty(AtmTemplateName);
 
+        // One-slot signal queue — see THREADING note in the header. OnMarketData (market-data
+        // thread) writes; OnBarUpdate (strategy thread) reads and clears. Overwrite semantics:
+        // a newer cluster replaces an undrained older one, matching "always follow the latest
+        // big entry" — there is never more than 1 tick between write and drain anyway.
+        private bool     _signalQueued;
+        private bool     _signalIsBuy;
+        private DateTime _signalTime;
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -132,6 +151,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _dailyLockout     = false;
                 _lastResetBar     = -1;
                 _orderPending     = false;
+                _signalQueued     = false;
+                _signalIsBuy      = false;
+                _signalTime       = default(DateTime);
 
                 _atmStrategyId       = string.Empty;
                 _atmOrderId          = string.Empty;
@@ -166,6 +188,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             PollAtmState();
             CheckRiskGovernor();
             CheckSessionEnd();
+
+            // Drain the signal queue LAST, after the governor/session checks above have had a
+            // chance to update _dailyLockout/_orderPending on fresh state for this tick.
+            if (_signalQueued)
+            {
+                _signalQueued = false;
+                TryEnter(_signalIsBuy, _signalTime);
+            }
         }
 
         // ATM orders don't fire OnExecutionUpdate, so ATM mode confirms fills/closes by polling
@@ -178,7 +208,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State != State.Realtime || string.IsNullOrEmpty(_atmStrategyId))
                 return;
 
-            MarketPosition atmPos = GetAtmStrategyMarketPosition(_atmStrategyId);
+            MarketPosition? atmPosOpt = SafeGetAtmMarketPosition(_atmStrategyId);
+            if (atmPosOpt == null)
+                return; // transient exception already printed — retry next tick
+            MarketPosition atmPos = atmPosOpt.Value;
 
             // Deadlock guard: an entry order that dies AFTER AtmStrategyCreate() succeeded (margin
             // rejection, manual cancel, Day-TIF expiry) never produces a position, so the fill-
@@ -188,7 +221,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             // position, and that case is correctly handled as a fill below, not a dead order here.
             if (_atmPending && atmPos == MarketPosition.Flat)
             {
-                string[] status = GetAtmStrategyEntryOrderStatus(_atmOrderId); // empty until the order registers
+                string[] status;
+                try { status = GetAtmStrategyEntryOrderStatus(_atmOrderId); } // empty until the order registers
+                catch (Exception ex)
+                {
+                    Print(string.Format("[BigPrints] GetAtmStrategyEntryOrderStatus threw: {0}.", ex.Message));
+                    status = Array.Empty<string>();
+                }
                 if (status.Length == 3 &&
                     (string.Equals(status[2], "Rejected", StringComparison.OrdinalIgnoreCase) ||
                      string.Equals(status[2], "Cancelled", StringComparison.OrdinalIgnoreCase)))
@@ -348,6 +387,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch { return 0.0; }
         }
 
+        // Shared by PollAtmState and TryEnterAtm. A transient invalid-id exception (e.g. mid ATM
+        // teardown) must never propagate out of a strategy event — null signals "try again next
+        // tick" to the caller instead.
+        private MarketPosition? SafeGetAtmMarketPosition(string atmId)
+        {
+            try { return GetAtmStrategyMarketPosition(atmId); }
+            catch (Exception ex)
+            {
+                Print(string.Format("[BigPrints] GetAtmStrategyMarketPosition threw: {0}.", ex.Message));
+                return null;
+            }
+        }
+
         private bool InSession(DateTime marketTime)
         {
             int t     = ToTime(marketTime);
@@ -446,7 +498,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            TryEnter(_clusterIsBuy, now);
+            // Queue for OnBarUpdate instead of calling TryEnter directly here — this runs on the
+            // market-data thread (see THREADING note in the header); order submissions must not.
+            _signalQueued = true;
+            _signalIsBuy  = _clusterIsBuy;
+            _signalTime   = now;
         }
 
         // Entry / reversal logic — dispatches to the active mode.
@@ -515,9 +571,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         // _atmReverseToBuy carries the queued direction across that gap.
         private void TryEnterAtm(bool isBuy)
         {
-            MarketPosition atmPos = string.IsNullOrEmpty(_atmStrategyId)
-                ? MarketPosition.Flat
-                : GetAtmStrategyMarketPosition(_atmStrategyId);
+            MarketPosition atmPos;
+            if (string.IsNullOrEmpty(_atmStrategyId))
+            {
+                atmPos = MarketPosition.Flat;
+            }
+            else
+            {
+                MarketPosition? atmPosOpt = SafeGetAtmMarketPosition(_atmStrategyId);
+                if (atmPosOpt == null)
+                    return; // transient exception already printed — this signal is dropped, not queued (matches TryEnter's other no-op gates)
+                atmPos = atmPosOpt.Value;
+            }
 
             if (atmPos == MarketPosition.Flat)
             {
