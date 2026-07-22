@@ -1,0 +1,38 @@
+# BigPrints
+
+NinjaTrader 8 indicator that flags large aggressive market orders (buy/sell sweeps) on the Level 1 tape and marks them on the chart at the exact price they printed, with the swept contract count.
+
+Built for ES futures; works on any instrument with a live tape.
+
+## What it does
+
+- Listens to every `Last` print via `OnMarketData` and classifies the aggressor (at ask = buyer, at bid = seller).
+- Reconstructs sweeps: consecutive same-side prints within `Cluster Milliseconds` (default 150 ms) are folded into one cluster, so a single 300-lot order that swept 3 price levels counts as one 300-contract entry, not three small ones.
+- When a finished cluster totals `Min Volume` contracts or more (default **150**), it draws a dot at the anchor price (the largest print of the sweep) plus a text label with the total contract count — green for buyers, red for sellers.
+
+## Data requirements
+
+Level 1 only. No Level 2 / market depth subscription needed.
+
+**Real-time and Market Replay only** — `OnMarketData` does not fire on historical data, so nothing is drawn on a freshly loaded historical chart. This is by design.
+
+## Parameters
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| Min Volume | 150 | Minimum total contracts in a sweep cluster to draw it |
+| Cluster Milliseconds | 150 | Max gap between same-side prints to still count as one sweep |
+| Text Size | 14 | Font size of the contract-count label |
+| Buy Brush / Sell Brush | Lime / Red | Cluster colors |
+
+## Install
+
+Copy `BigPrints.cs` to `Documents\NinjaTrader 8\bin\Custom\Indicators\`, then compile in NT8 (NinjaScript Editor → F5). Add "BigPrints" to a chart.
+
+## Recommended timeframe
+
+1-minute chart for live monitoring (see repo discussion). The detection itself is timeframe-independent — it runs on the tape, not on bars — the timeframe only affects how the marks are spaced horizontally.
+
+## Development
+
+Compiled outside NT8 with [nt8c](https://github.com/jalv92) (Roslyn parity with the NinjaScript Editor).
