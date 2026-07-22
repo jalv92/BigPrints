@@ -1,5 +1,6 @@
 #region Using declarations
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using NinjaTrader.Cbi;
@@ -53,9 +54,20 @@ using NinjaTrader.NinjaScript;
 // OnBarUpdate for the same reason. OnMarketData must stay purely computational — read/compute
 // only, zero Enter*/AtmStrategy*/Exit* calls — forever. Latency cost of the queue is <= 1 tick.
 //
+// PLAYBACK ADVISORY (2026-07-21): NT8 8.1.8's OWN ATM-from-NinjaScript order path is a crasher
+// in Playback, not something in this file — THREE separate crash dumps (22:57, 23:04, 23:20)
+// all die inside NinjaScript.AtmStrategy.SubmitEntryOrders / the Strategy2Order SQLite write,
+// the last one AFTER the OnMarketData->OnBarUpdate threading fix above was already in place.
+// Vendor bug in NT8 8.1.8's ATM engine under Playback's compressed post-trade timing — no
+// further workaround exists on our side. RECOMMENDATION: use NATIVE mode with StopLossTicks /
+// ProfitTargetTicks (below) for Playback and testing; reserve ATM mode for live/sim accounts,
+// where the timing that triggers the bug does not occur.
+//
 // LIVE-MONEY GATE (not fixed in v1 by design) — read before enabling on a funded account:
-//   - No per-trade stop loss in NATIVE mode; only the daily USD governor (target/loss) bounds
-//     risk there. This is SOLVED in ATM mode — use an ATM template with a real stop.
+//   - NATIVE mode has no per-trade stop loss unless StopLossTicks/ProfitTargetTicks are set
+//     (both 0 = disabled, the original default) — either way, the daily USD governor always
+//     applies. ATM mode gets its stop/target from the template instead — but see the PLAYBACK
+//     ADVISORY above before using ATM mode in Playback.
 //   - Daily PnL baseline (_dayStartRealized / _atmRealizedPnLToday) resets on strategy restart,
 //     not only on a new trading day — restarting mid-session re-baselines and can hide same-day PnL.
 //   - No account-position adoption (StartBehavior.WaitUntilFlat) — a manually-opened position
@@ -110,7 +122,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         // big entry" — there is never more than 1 tick between write and drain anyway.
         private bool     _signalQueued;
         private bool     _signalIsBuy;
+        private long     _signalVolume;
         private DateTime _signalTime;
+
+        // Aggression-balance reversal filter (feature 2). Ledger of every drained signal (traded
+        // or not) within a rolling AggressionWindowSeconds window, used ONLY at the reversal
+        // decision to require the new side's recent volume to dominate the held side's — filters
+        // a lone counter-signal out of a two-sided battle. OnBarUpdate-only (strategy thread);
+        // never touched from OnMarketData.
+        private struct AggressionRecord
+        {
+            public DateTime Time;
+            public bool     IsBuy;
+            public long     Volume;
+        }
+        private readonly List<AggressionRecord> _aggressionLedger = new List<AggressionRecord>();
 
         protected override void OnStateChange()
         {
@@ -135,12 +161,33 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DailyProfitTargetUSD = 500;
                 DailyLossLimitUSD    = 300;
                 AtmTemplateName      = "";    // empty = native mode
+                StopLossTicks        = 0;     // 0 = disabled
+                ProfitTargetTicks    = 0;     // 0 = disabled
+                AggressionWindowSeconds = 180;
+                ReversalDominanceRatio  = 1.5;
             }
             else if (State == State.Configure)
             {
                 // No extra data series — this strategy trades off the Level-I tape (OnMarketData),
                 // not off bar closes. The primary Bars series only supplies session/day-boundary
                 // context (Time[0], Bars.IsFirstBarOfSession) for the risk/session governor.
+
+                // Native-mode per-trade brackets (see PLAYBACK ADVISORY in the header). Must be
+                // set here, before any entry is submitted, and tied to each entry's own signal
+                // name so the managed engine auto-attaches/replaces the bracket per entry/
+                // reversal. Naturally a no-op in ATM mode too: "BigPrintLong"/"BigPrintShort" are
+                // never used as entry signal names there (AtmStrategyCreate is used instead), so
+                // these brackets simply never have a matching entry to attach to.
+                if (StopLossTicks > 0)
+                {
+                    SetStopLoss("BigPrintLong",  CalculationMode.Ticks, StopLossTicks, false);
+                    SetStopLoss("BigPrintShort", CalculationMode.Ticks, StopLossTicks, false);
+                }
+                if (ProfitTargetTicks > 0)
+                {
+                    SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, ProfitTargetTicks);
+                    SetProfitTarget("BigPrintShort", CalculationMode.Ticks, ProfitTargetTicks);
+                }
             }
             else if (State == State.DataLoaded)
             {
@@ -153,7 +200,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _orderPending     = false;
                 _signalQueued     = false;
                 _signalIsBuy      = false;
+                _signalVolume     = 0;
                 _signalTime       = default(DateTime);
+                _aggressionLedger.Clear();
 
                 _atmStrategyId       = string.Empty;
                 _atmOrderId          = string.Empty;
@@ -194,8 +243,51 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_signalQueued)
             {
                 _signalQueued = false;
+                // Ledger BEFORE the gates in TryEnter — a signal that gets skipped (pending/
+                // lockout/session) is still real tape flow for the reversal dominance filter.
+                RecordAggression(_signalIsBuy, _signalVolume, _signalTime);
                 TryEnter(_signalIsBuy, _signalTime);
             }
+        }
+
+        // OnBarUpdate-only (strategy thread) — see field comment on _aggressionLedger.
+        private void RecordAggression(bool isBuy, long volume, DateTime time)
+        {
+            _aggressionLedger.Add(new AggressionRecord { Time = time, IsBuy = isBuy, Volume = volume });
+            PruneAggressionLedger(time);
+        }
+
+        private void PruneAggressionLedger(DateTime now)
+        {
+            DateTime cutoff = now.AddSeconds(-AggressionWindowSeconds);
+            _aggressionLedger.RemoveAll(r => r.Time < cutoff);
+        }
+
+        private long SumAggression(bool isBuy, DateTime now)
+        {
+            PruneAggressionLedger(now); // prune before summing too, per spec
+            long sum = 0;
+            for (int i = 0; i < _aggressionLedger.Count; i++)
+                if (_aggressionLedger[i].IsBuy == isBuy)
+                    sum += _aggressionLedger[i].Volume;
+            return sum;
+        }
+
+        // Reversal-only filter — never called for an entry from flat. Requires the new side's
+        // recent windowed volume to dominate the held side's by ReversalDominanceRatio, so a
+        // lone counter-signal inside a two-sided battle doesn't flip the position.
+        private bool PassesReversalFilter(bool heldIsBuy, bool newIsBuy, DateTime now)
+        {
+            long sumNew  = SumAggression(newIsBuy, now);
+            long sumHeld = SumAggression(heldIsBuy, now);
+
+            bool reverse = sumHeld == 0 || sumNew >= ReversalDominanceRatio * sumHeld;
+
+            Print(string.Format("[BigPrints] Reversal check: new {0} sum={1} vs held {2} sum={3} ({4}s) -> {5}",
+                newIsBuy ? "BUY" : "SELL", sumNew, heldIsBuy ? "BUY" : "SELL", sumHeld,
+                AggressionWindowSeconds, reverse ? "REVERSE" : "HOLD"));
+
+            return reverse;
         }
 
         // ATM orders don't fire OnExecutionUpdate, so ATM mode confirms fills/closes by polling
@@ -502,6 +594,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             // market-data thread (see THREADING note in the header); order submissions must not.
             _signalQueued = true;
             _signalIsBuy  = _clusterIsBuy;
+            _signalVolume = _clusterVolume;
             _signalTime   = now;
         }
 
@@ -532,15 +625,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             if (IsAtmMode)
-                TryEnterAtm(isBuy);
+                TryEnterAtm(isBuy, marketTime);
             else
-                TryEnterNative(isBuy);
+                TryEnterNative(isBuy, marketTime);
         }
 
         // NATIVE mode: EnterLong/EnterShort while in the opposite position reverses in one
         // managed-approach order (close + open), per NT8's documented Entry() reversal behavior
-        // — no separate Exit() call needed.
-        private void TryEnterNative(bool isBuy)
+        // — no separate Exit() call needed. The reversal branches are gated by the aggression-
+        // balance filter (feature 2); the flat-entry branch is never filtered.
+        private void TryEnterNative(bool isBuy, DateTime now)
         {
             MarketPosition pos = Position.MarketPosition;
 
@@ -553,12 +647,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (pos == MarketPosition.Long && !isBuy)
             {
+                if (!PassesReversalFilter(true, isBuy, now))
+                    return; // consumed — position rides, no reversal
+
                 EnterShort(Contracts, "BigPrintShort");
                 _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: SELL x{0}", Contracts));
             }
             else if (pos == MarketPosition.Short && isBuy)
             {
+                if (!PassesReversalFilter(false, isBuy, now))
+                    return;
+
                 EnterLong(Contracts, "BigPrintLong");
                 _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: BUY x{0}", Contracts));
@@ -568,8 +668,9 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ATM mode: reversal is two async steps (unlike native's single-order reverse) — close
         // the live ATM, then create the opposite one once PollAtmState() confirms it's flat.
-        // _atmReverseToBuy carries the queued direction across that gap.
-        private void TryEnterAtm(bool isBuy)
+        // _atmReverseToBuy carries the queued direction across that gap. The reversal branches
+        // are gated by the aggression-balance filter (feature 2); flat-entry is never filtered.
+        private void TryEnterAtm(bool isBuy, DateTime now)
         {
             MarketPosition atmPos;
             if (string.IsNullOrEmpty(_atmStrategyId))
@@ -588,8 +689,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 CreateAtm(isBuy);
             }
-            else if ((atmPos == MarketPosition.Long && !isBuy) || (atmPos == MarketPosition.Short && isBuy))
+            else if (atmPos == MarketPosition.Long && !isBuy)
             {
+                if (!PassesReversalFilter(true, isBuy, now))
+                    return; // consumed — position rides, no reversal
+
+                _atmClosing      = true;
+                _atmReverseToBuy = isBuy;
+                _orderPending    = true;
+                Print(string.Format("[BigPrints] ATM close submitted: reversal to {0}", isBuy ? "BUY" : "SELL"));
+                AtmStrategyClose(_atmStrategyId);
+            }
+            else if (atmPos == MarketPosition.Short && isBuy)
+            {
+                if (!PassesReversalFilter(false, isBuy, now))
+                    return;
+
                 _atmClosing      = true;
                 _atmReverseToBuy = isBuy;
                 _orderPending    = true;
@@ -638,6 +753,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         // is stale until this fires, and NT8's built-in duplicate-order guard does not cover
         // market orders — this is the gate that actually prevents double-submission.
         // NATIVE MODE ONLY — ATM-managed orders don't fire this callback (see PollAtmState instead).
+        // VERIFIED harmless with native brackets (StopLossTicks/ProfitTargetTicks) now in play:
+        // this clears on ANY order for this strategy, not just the entry, so a bracket (Stop
+        // loss/Profit target) fill re-fires this clear too — but _orderPending is already false
+        // by then (cleared back when the ENTRY itself filled), so it's a false->false no-op. A
+        // reversal's old bracket is auto-cancelled by NT8 with zero fill (see SetStopLoss docs),
+        // which does not raise OnExecutionUpdate at all, so there is no interleaving risk either.
         protected override void OnExecutionUpdate(Execution execution, string executionId,
             double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
         {
@@ -688,6 +809,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "ATM Template Name", Description = "Empty = native mode (managed EnterLong/EnterShort, no per-trade stop). Set to an ATM template name to route entries through that ATM — SL/TP are then managed by the template.", Order = 8, GroupName = "Parameters")]
         public string AtmTemplateName { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 2000)]
+        [Display(Name = "Stop Loss (ticks)", Description = "NATIVE mode only, ignored in ATM mode. 0 = disabled.", Order = 9, GroupName = "Parameters")]
+        public int StopLossTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 2000)]
+        [Display(Name = "Profit Target (ticks)", Description = "NATIVE mode only, ignored in ATM mode. 0 = disabled.", Order = 10, GroupName = "Parameters")]
+        public int ProfitTargetTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(10, 3600)]
+        [Display(Name = "Aggression Window (sec)", Description = "Lookback window for the reversal dominance filter — how far back to sum recent big-print volume by side.", Order = 11, GroupName = "Parameters")]
+        public int AggressionWindowSeconds { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 10)]
+        [Display(Name = "Reversal Dominance Ratio", Description = "A reversal only fires if the new side's windowed volume is at least this many times the held side's — filters a lone counter-signal out of a two-sided battle.", Order = 12, GroupName = "Parameters")]
+        public double ReversalDominanceRatio { get; set; }
         #endregion
     }
 }
