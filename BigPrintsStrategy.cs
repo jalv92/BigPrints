@@ -22,10 +22,23 @@ using NinjaTrader.NinjaScript;
 // tape to replay the aggressor logic against. It only trades while running live or in Market
 // Replay (both report State.Realtime, which the code below relies on).
 //
+// HYBRID ATM MODE (AtmTemplateName parameter — pattern mirrored from TBStrategy.cs in this repo):
+//   - Empty (default): NATIVE mode — EnterLong/EnterShort managed orders, no per-trade stop.
+//   - Set to an ATM template name: ATM mode — entries go through AtmStrategyCreate(); the
+//     template's own stop/target manage the exit. Reversal = AtmStrategyClose() on the live ATM,
+//     then a new AtmStrategyCreate() once it reports flat (see TryEnterAtm/PollAtmState). ATM
+//     order quantity comes from the TEMPLATE's own Quantity setting, NOT the Contracts property
+//     (Contracts only applies in native mode — AtmStrategyCreate() has no quantity parameter).
+//   - CAVEAT: in ATM mode, Position.MarketPosition (this NinjaScript strategy's own position)
+//     stays Flat the whole time — the ATM owns the real position at the account level, so the
+//     strategy's chart position/PnL display will NOT reflect it. Use GetAtmStrategyMarketPosition
+//     / the ATM's own reporting to see the real state.
+//
 // LIVE-MONEY GATE (not fixed in v1 by design) — read before enabling on a funded account:
-//   - No per-trade stop loss; only the daily USD governor (target/loss) bounds risk.
-//   - Daily PnL baseline (_dayStartRealized) resets on strategy restart, not only on a new
-//     trading day — restarting mid-session re-baselines CumProfit and can hide same-day PnL.
+//   - No per-trade stop loss in NATIVE mode; only the daily USD governor (target/loss) bounds
+//     risk there. This is SOLVED in ATM mode — use an ATM template with a real stop.
+//   - Daily PnL baseline (_dayStartRealized / _atmRealizedPnLToday) resets on strategy restart,
+//     not only on a new trading day — restarting mid-session re-baselines and can hide same-day PnL.
 //   - No account-position adoption (StartBehavior.WaitUntilFlat) — a manually-opened position
 //     on this account is invisible to this strategy.
 //   - ConnectionLossHandling left at its NT8 default — no custom reconnect/flatten policy.
@@ -53,11 +66,24 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   _dailyLockout;
         private int    _lastResetBar = -1;
 
-        // Set on EVERY Enter/Exit submission, cleared in OnExecutionUpdate once that order
-        // reaches a terminal state. Position.MarketPosition is stale until the fill confirms,
-        // and NT8's duplicate-order safety net does not cover market orders — without this gate
-        // a rapid opposite cluster (or the risk governor's per-tick retry) would double-submit.
+        // Set on EVERY Enter/Exit (native) or AtmStrategyCreate/Close (ATM) submission, cleared
+        // once that submission's outcome is confirmed — OnExecutionUpdate in native mode,
+        // PollAtmState() in ATM mode (OnExecutionUpdate does NOT fire for ATM-managed orders).
+        // Position.MarketPosition is stale until the fill confirms, and NT8's duplicate-order
+        // safety net does not cover market orders — without this gate a rapid opposite cluster
+        // (or the risk governor's per-tick retry) would double-submit.
         private bool _orderPending;
+
+        // --- ATM state (Hybrid mode — pattern mirrored from TBStrategy.cs) ---
+        private string _atmStrategyId  = string.Empty;
+        private string _atmOrderId     = string.Empty;
+        private bool   _atmPending;         // AtmStrategyCreate submitted, entry fill not yet confirmed
+        private bool   _atmPositionOpen;    // ATM reports a live (non-flat) market position
+        private bool   _atmClosing;         // AtmStrategyClose submitted, flat not yet confirmed
+        private bool?  _atmReverseToBuy;    // set only when the close is to make room for a reversal
+        private double _atmRealizedPnLToday; // SystemPerformance does not track ATM trades — summed by hand
+
+        private bool IsAtmMode => !string.IsNullOrEmpty(AtmTemplateName);
 
         protected override void OnStateChange()
         {
@@ -81,6 +107,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SessionEnd           = 1555;  // 15:55
                 DailyProfitTargetUSD = 500;
                 DailyLossLimitUSD    = 300;
+                AtmTemplateName      = "";    // empty = native mode
             }
             else if (State == State.Configure)
             {
@@ -97,6 +124,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _dailyLockout     = false;
                 _lastResetBar     = -1;
                 _orderPending     = false;
+
+                _atmStrategyId       = string.Empty;
+                _atmOrderId          = string.Empty;
+                _atmPending          = false;
+                _atmPositionOpen     = false;
+                _atmClosing          = false;
+                _atmReverseToBuy     = null;
+                _atmRealizedPnLToday = 0;
             }
         }
 
@@ -123,35 +158,101 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_clusterOpen && (Time[0] - _clusterLastTime).TotalMilliseconds > MaxClusterSpanMs)
                 _clusterOpen = false;
 
+            PollAtmState();
             CheckRiskGovernor();
             CheckSessionEnd();
+        }
+
+        // ATM orders don't fire OnExecutionUpdate, so ATM mode confirms fills/closes by polling
+        // GetAtmStrategyMarketPosition() every tick — but only while something is actually in
+        // flight (hot-path gate below), mirroring TBStrategy's HasAtmPosition() gating.
+        private void PollAtmState()
+        {
+            if (!_atmPending && !_atmPositionOpen && !_atmClosing)
+                return;
+            if (State != State.Realtime || string.IsNullOrEmpty(_atmStrategyId))
+                return;
+
+            MarketPosition atmPos = GetAtmStrategyMarketPosition(_atmStrategyId);
+
+            if (_atmPending && atmPos != MarketPosition.Flat)
+            {
+                // Entry confirmed filled.
+                _atmPending      = false;
+                _atmPositionOpen = true;
+                _orderPending    = false;
+            }
+
+            if ((_atmPositionOpen || _atmClosing) && atmPos == MarketPosition.Flat)
+            {
+                // ATM went flat — book its realized PnL before discarding the id (governor needs it).
+                double realized = 0;
+                try { realized = GetAtmStrategyRealizedProfitLoss(_atmStrategyId); } catch { }
+                _atmRealizedPnLToday += realized;
+
+                _atmPositionOpen = false;
+                _atmStrategyId   = string.Empty;
+                _atmOrderId      = string.Empty;
+
+                bool? reverseTo = _atmReverseToBuy;
+                _atmClosing      = false;
+                _atmReverseToBuy = null;
+
+                if (reverseTo.HasValue)
+                    CreateAtm(reverseTo.Value); // re-sets _atmPending/_orderPending for the new leg
+                else
+                    _orderPending = false;
+            }
         }
 
         private void DailyReset()
         {
             // nt8c-safe path (see Apertura4HMSS.cs for the same pattern): documented API for the
-            // strategy's own cumulative realized PnL across all trades so far.
-            _dayStartRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
-            _dailyLockout     = false;
+            // strategy's own cumulative realized PnL across all trades so far. Native mode only —
+            // SystemPerformance does not track ATM trades, hence the separate ATM accumulator.
+            _dayStartRealized    = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            _atmRealizedPnLToday = 0;
+            _dailyLockout        = false;
+        }
+
+        // True when the strategy has no effective open exposure in the active mode. Position.
+        // MarketPosition is always Flat in ATM mode (the ATM owns the real position), so every
+        // "do we need to flatten" check must route through this instead of reading Position directly.
+        private bool IsEffectivelyFlat()
+        {
+            return IsAtmMode
+                ? (string.IsNullOrEmpty(_atmStrategyId) || !_atmPositionOpen)
+                : Position.MarketPosition == MarketPosition.Flat;
         }
 
         private void CheckRiskGovernor()
         {
             if (_dailyLockout)
             {
-                // Already locked out — a single ExitLong/ExitShort call isn't guaranteed to fill;
-                // keep retrying the flatten every tick until the position is actually flat.
-                if (Position.MarketPosition != MarketPosition.Flat && !_orderPending)
+                // Already locked out — a single Exit/Close call isn't guaranteed to fill;
+                // keep retrying the flatten every tick until effectively flat.
+                if (!IsEffectivelyFlat() && !_orderPending)
                     FlattenNow("BigPrintRiskGovernor");
                 return;
             }
             if (DailyProfitTargetUSD <= 0 && DailyLossLimitUSD <= 0)
                 return; // both disabled — nothing to compute
 
-            double realized   = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit - _dayStartRealized;
-            double unrealized = Position.MarketPosition != MarketPosition.Flat
-                ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
-                : 0.0;
+            double realized, unrealized;
+            if (IsAtmMode)
+            {
+                realized   = _atmRealizedPnLToday;
+                unrealized = (_atmPositionOpen && !string.IsNullOrEmpty(_atmStrategyId))
+                    ? SafeGetAtmUnrealized(_atmStrategyId)
+                    : 0.0;
+            }
+            else
+            {
+                realized   = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit - _dayStartRealized;
+                unrealized = Position.MarketPosition != MarketPosition.Flat
+                    ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
+                    : 0.0;
+            }
             double dayPnL = realized + unrealized;
 
             bool hitTarget = DailyProfitTargetUSD > 0 && dayPnL >= DailyProfitTargetUSD;
@@ -170,14 +271,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             // !InSession() also flattens correctly for an overnight (wraparound) window — no
             // separate ">= SessionEnd" comparison needed.
-            if (!InSession(Time[0]) && Position.MarketPosition != MarketPosition.Flat)
+            if (!InSession(Time[0]) && !IsEffectivelyFlat())
                 FlattenNow("BigPrintSessionEnd");
         }
 
         private void FlattenNow(string signalName)
         {
             if (_orderPending)
-                return; // an Enter/Exit is already in flight — don't stack a second submission
+                return; // a submission is already in flight — don't stack a second one
+
+            if (IsAtmMode)
+            {
+                if (!string.IsNullOrEmpty(_atmStrategyId) && (_atmPositionOpen || _atmPending))
+                {
+                    _atmClosing      = true;
+                    _atmReverseToBuy = null; // plain flatten — no reversal queued behind this close
+                    _orderPending    = true;
+                    AtmStrategyClose(_atmStrategyId);
+                }
+                return;
+            }
 
             if (Position.MarketPosition == MarketPosition.Long)
             {
@@ -189,6 +302,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ExitShort(signalName);
                 _orderPending = true;
             }
+        }
+
+        private double SafeGetAtmUnrealized(string atmId)
+        {
+            try { return GetAtmStrategyUnrealizedProfitLoss(atmId); }
+            catch { return 0.0; }
         }
 
         private bool InSession(DateTime marketTime)
@@ -276,20 +395,30 @@ namespace NinjaTrader.NinjaScript.Strategies
             TryEnter(_clusterIsBuy, now);
         }
 
-        // Entry / reversal logic.
+        // Entry / reversal logic — dispatches to the active mode.
         //   1. Flat            -> enter in the aggressor's direction.
-        //   2. Opposite cluster while positioned -> EnterLong/EnterShort while in the opposite
-        //      position reverses in one managed-approach order (close + open), per NT8's
-        //      documented Entry() reversal behavior — no separate Exit() call needed.
+        //   2. Opposite cluster while positioned -> reverse.
         //   3. Same-direction cluster while positioned -> no-op, stay in.
-        // v1 has no per-trade stop/target (user spec: daily limits only, via the risk governor
-        // above). To add one later: call SetStopLoss/SetProfitTarget right after each EnterLong/
-        // EnterShort call below, tied to the same signal name ("BigPrintLong"/"BigPrintShort").
+        // Native v1 has no per-trade stop/target (user spec: daily limits only, via the risk
+        // governor above). To add one later: call SetStopLoss/SetProfitTarget right after each
+        // EnterLong/EnterShort call in TryEnterNative, tied to the same signal name. ATM mode
+        // gets its stop/target from the template instead (see AtmTemplateName).
         private void TryEnter(bool isBuy, DateTime marketTime)
         {
             if (_orderPending || _dailyLockout || !InSession(marketTime))
                 return;
 
+            if (IsAtmMode)
+                TryEnterAtm(isBuy);
+            else
+                TryEnterNative(isBuy);
+        }
+
+        // NATIVE mode: EnterLong/EnterShort while in the opposite position reverses in one
+        // managed-approach order (close + open), per NT8's documented Entry() reversal behavior
+        // — no separate Exit() call needed.
+        private void TryEnterNative(bool isBuy)
+        {
             MarketPosition pos = Position.MarketPosition;
 
             if (pos == MarketPosition.Flat)
@@ -311,14 +440,70 @@ namespace NinjaTrader.NinjaScript.Strategies
             // else: same-direction cluster while already positioned — stay in, do nothing.
         }
 
+        // ATM mode: reversal is two async steps (unlike native's single-order reverse) — close
+        // the live ATM, then create the opposite one once PollAtmState() confirms it's flat.
+        // _atmReverseToBuy carries the queued direction across that gap.
+        private void TryEnterAtm(bool isBuy)
+        {
+            MarketPosition atmPos = string.IsNullOrEmpty(_atmStrategyId)
+                ? MarketPosition.Flat
+                : GetAtmStrategyMarketPosition(_atmStrategyId);
+
+            if (atmPos == MarketPosition.Flat)
+            {
+                CreateAtm(isBuy);
+            }
+            else if ((atmPos == MarketPosition.Long && !isBuy) || (atmPos == MarketPosition.Short && isBuy))
+            {
+                _atmClosing      = true;
+                _atmReverseToBuy = isBuy;
+                _orderPending    = true;
+                AtmStrategyClose(_atmStrategyId);
+            }
+            // else: same-direction cluster while already positioned — stay in, do nothing.
+        }
+
+        private void CreateAtm(bool isBuy)
+        {
+            if (State != State.Realtime)
+                return;
+
+            _atmOrderId    = GetAtmStrategyUniqueId();
+            _atmStrategyId = GetAtmStrategyUniqueId();
+            _atmPending    = true;
+            _orderPending  = true;
+
+            string thisAtmId = _atmStrategyId; // capture — a reversal can overwrite the field before this fires
+
+            AtmStrategyCreate(
+                isBuy ? OrderAction.Buy : OrderAction.SellShort,
+                OrderType.Market, 0, 0, TimeInForce.Day,
+                _atmOrderId, AtmTemplateName, thisAtmId,
+                (errorCode, callbackId) =>
+                {
+                    if (callbackId != thisAtmId || errorCode == ErrorCode.NoError)
+                        return;
+
+                    Print(string.Format("[BigPrintsStrategy] ATM create error: {0}. Resetting.", errorCode));
+                    if (_atmStrategyId == thisAtmId)
+                    {
+                        _atmPending    = false;
+                        _atmStrategyId = string.Empty;
+                        _atmOrderId    = string.Empty;
+                        _orderPending  = false;
+                    }
+                });
+        }
+
         // Clears _orderPending once the in-flight order reaches a terminal state, so the next
         // cluster signal (or the risk-governor retry) is free to submit again. Position.MarketPosition
         // is stale until this fires, and NT8's built-in duplicate-order guard does not cover
         // market orders — this is the gate that actually prevents double-submission.
+        // NATIVE MODE ONLY — ATM-managed orders don't fire this callback (see PollAtmState instead).
         protected override void OnExecutionUpdate(Execution execution, string executionId,
             double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
         {
-            if (execution?.Order == null)
+            if (IsAtmMode || execution?.Order == null)
                 return;
 
             OrderState state = execution.Order.OrderState;
@@ -339,7 +524,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(1, 20)]
-        [Display(Name = "Contracts", Description = "Quantity per entry (and per reversal leg). Capped at 20 (fat-finger guard).", Order = 3, GroupName = "Parameters")]
+        [Display(Name = "Contracts", Description = "Quantity per entry (and per reversal leg). Capped at 20 (fat-finger guard). NATIVE MODE ONLY — in ATM mode, size comes from the ATM template's own Quantity setting.", Order = 3, GroupName = "Parameters")]
         public int Contracts { get; set; }
 
         [NinjaScriptProperty]
@@ -361,6 +546,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(0, double.MaxValue)]
         [Display(Name = "Daily Loss Limit (USD)", Description = "Flatten and lock out entries for the rest of the day once hit. 0 = disabled.", Order = 7, GroupName = "Parameters")]
         public double DailyLossLimitUSD { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "ATM Template Name", Description = "Empty = native mode (managed EnterLong/EnterShort, no per-trade stop). Set to an ATM template name to route entries through that ATM — SL/TP are then managed by the template.", Order = 8, GroupName = "Parameters")]
+        public string AtmTemplateName { get; set; }
         #endregion
     }
 }
