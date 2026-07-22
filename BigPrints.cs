@@ -11,6 +11,7 @@ using NinjaTrader.Data;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Tools;
 using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.DrawingTools;
 #endregion
 
 // BigPrints v1.0.0
