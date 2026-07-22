@@ -68,6 +68,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 ClusterMilliseconds = 150;
                 TextSize            = 14;
                 TextOffsetTicks     = 10;
+                EnableSound         = true;
+                BuySoundFile        = "BigPrintBuy.wav";
+                SellSoundFile       = "BigPrintSell.wav";
             }
             else if (State == State.Configure)
             {
@@ -202,6 +205,17 @@ namespace NinjaTrader.NinjaScript.Indicators
                 Draw.Dot(this, dotTag, false, _clusterMaxTime, _clusterPrice, dotBrush);
                 Draw.Text(this, textTag, false, _clusterVolume.ToString(), _clusterMaxTime, textY, 0,
                     dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, dotBrush, Brushes.Black, 70);
+
+                // Sound only on the live path — no audio alert firing during Terminated teardown.
+                if (EnableSound)
+                {
+                    string soundFile = _clusterIsBuy ? BuySoundFile : SellSoundFile;
+                    // Fully qualified (not a `using System.IO;`) — NinjaTrader.Gui brings its own
+                    // Path type into scope, and a bare "Path" here would collide with it.
+                    string fullPath = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "sounds", soundFile);
+                    if (System.IO.File.Exists(fullPath))
+                        PlaySound(fullPath);
+                }
             }
 
             _drawnClusterTags.Enqueue(_tagCounter);
@@ -234,8 +248,20 @@ namespace NinjaTrader.NinjaScript.Indicators
         [Display(Name = "Text Offset Ticks", Description = "Ticks between the current bar's high/low and the contract-count label.", Order = 4, GroupName = "Parameters")]
         public int TextOffsetTicks { get; set; }
 
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Sound", Description = "Play a sound alert every time a cluster is drawn.", Order = 5, GroupName = "Parameters")]
+        public bool EnableSound { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Buy Sound File", Description = "WAV file name (in the NinjaTrader 8 sounds folder) played on a buy cluster.", Order = 6, GroupName = "Parameters")]
+        public string BuySoundFile { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Sell Sound File", Description = "WAV file name (in the NinjaTrader 8 sounds folder) played on a sell cluster.", Order = 7, GroupName = "Parameters")]
+        public string SellSoundFile { get; set; }
+
         [XmlIgnore]
-        [Display(Name = "Buy Brush", Description = "Color for buy-aggressor clusters.", Order = 5, GroupName = "Parameters")]
+        [Display(Name = "Buy Brush", Description = "Color for buy-aggressor clusters.", Order = 8, GroupName = "Parameters")]
         public Brush BuyBrush
         {
             get { return _buyBrush; }
@@ -250,7 +276,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         [XmlIgnore]
-        [Display(Name = "Sell Brush", Description = "Color for sell-aggressor clusters.", Order = 6, GroupName = "Parameters")]
+        [Display(Name = "Sell Brush", Description = "Color for sell-aggressor clusters.", Order = 9, GroupName = "Parameters")]
         public Brush SellBrush
         {
             get { return _sellBrush; }
