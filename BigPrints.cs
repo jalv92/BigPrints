@@ -1,5 +1,6 @@
 #region Using declarations
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Windows;
@@ -33,10 +34,20 @@ namespace NinjaTrader.NinjaScript.Indicators
         private bool     _clusterIsBuy;
         private long     _clusterVolume;
         private double   _clusterPrice;      // price of the largest single print in the cluster
-        private long     _clusterMaxPrint;    // volume of that largest print, to pick the anchor price
+        private long     _clusterMaxPrint;   // volume of that largest print, to pick the anchor price
+        private DateTime _clusterMaxTime;    // time of that largest print — the real anchor for the marker
         private DateTime _clusterLastTime;
+        private DateTime _clusterStartTime;
 
         private int _tagCounter;
+
+        // ponytail: hard cap on live draw objects — a slow steady same-side drip (prints every
+        // ~150ms for minutes) would otherwise merge into one giant blob AND draw objects are
+        // never removed, so chart memory grows without bound over a session. 400 clusters is
+        // several hours of ES 150+ contract sweeps at normal cadence; raise if that's not enough.
+        private const int MaxClusterSpanMs = 1500;
+        private const int MaxDrawObjects   = 400;
+        private readonly Queue<int> _drawnClusterTags = new Queue<int>();
 
         private Brush _buyBrush  = Brushes.Lime;
         private Brush _sellBrush = Brushes.Red;
@@ -70,7 +81,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 // Flush whatever sweep was mid-cluster when the chart/session ended — otherwise
                 // the very last (often largest) print of the session never gets drawn.
-                FinalizeCluster();
+                FinalizeCluster(true);
             }
         }
 
@@ -108,31 +119,37 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             if (_clusterOpen &&
                 isBuy == _clusterIsBuy &&
-                (e.Time - _clusterLastTime).TotalMilliseconds <= ClusterMilliseconds)
+                (e.Time - _clusterLastTime).TotalMilliseconds <= ClusterMilliseconds &&
+                (e.Time - _clusterStartTime).TotalMilliseconds <= MaxClusterSpanMs)
             {
-                // Same side, within the sweep window — fold into the open cluster.
+                // Same side, within the sweep window and the hard wall-clock cap — fold into the cluster.
                 _clusterVolume  += e.Volume;
                 _clusterLastTime = e.Time;
                 if (e.Volume > _clusterMaxPrint)
                 {
                     _clusterMaxPrint = e.Volume;
                     _clusterPrice    = e.Price;
+                    _clusterMaxTime  = e.Time;
                 }
                 return;
             }
 
-            // Opposite side or gap exceeded — finalize whatever cluster was open, then start a new one.
-            FinalizeCluster();
+            // Opposite side, gap exceeded, or max span exceeded — finalize the open cluster, start a new one.
+            FinalizeCluster(false);
 
-            _clusterOpen     = true;
-            _clusterIsBuy    = isBuy;
-            _clusterVolume   = e.Volume;
-            _clusterPrice    = e.Price;
-            _clusterMaxPrint = e.Volume;
-            _clusterLastTime = e.Time;
+            _clusterOpen      = true;
+            _clusterIsBuy     = isBuy;
+            _clusterVolume    = e.Volume;
+            _clusterPrice     = e.Price;
+            _clusterMaxPrint  = e.Volume;
+            _clusterMaxTime   = e.Time;
+            _clusterLastTime  = e.Time;
+            _clusterStartTime = e.Time;
         }
 
-        private void FinalizeCluster()
+        // bestEffort: true only when called from State.Terminated, where the chart/ChartControl
+        // may already be torn down on that thread — draw failures there are swallowed, not fatal.
+        private void FinalizeCluster(bool bestEffort)
         {
             if (!_clusterOpen)
                 return;
@@ -150,9 +167,32 @@ namespace NinjaTrader.NinjaScript.Indicators
             double offset  = 4 * TickSize;
             double textY   = _clusterIsBuy ? _clusterPrice + offset : _clusterPrice - offset;
 
-            Draw.Dot(this, dotTag, false, _clusterLastTime, _clusterPrice, dotBrush);
-            Draw.Text(this, textTag, false, _clusterVolume.ToString(), _clusterLastTime, textY, 0,
-                dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, null, null, 0);
+            // Anchor at the largest print's own price AND time — not the cluster's last print time,
+            // which can be a different (smaller) print later in the same sweep.
+            if (bestEffort)
+            {
+                try
+                {
+                    Draw.Dot(this, dotTag, false, _clusterMaxTime, _clusterPrice, dotBrush);
+                    Draw.Text(this, textTag, false, _clusterVolume.ToString(), _clusterMaxTime, textY, 0,
+                        dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, null, null, 0);
+                }
+                catch (Exception) { /* teardown thread — chart may already be gone, nothing to do */ }
+            }
+            else
+            {
+                Draw.Dot(this, dotTag, false, _clusterMaxTime, _clusterPrice, dotBrush);
+                Draw.Text(this, textTag, false, _clusterVolume.ToString(), _clusterMaxTime, textY, 0,
+                    dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, null, null, 0);
+            }
+
+            _drawnClusterTags.Enqueue(_tagCounter);
+            if (_drawnClusterTags.Count > MaxDrawObjects)
+            {
+                int oldest = _drawnClusterTags.Dequeue();
+                RemoveDrawObject("BigPrintDot" + oldest);
+                RemoveDrawObject("BigPrintText" + oldest);
+            }
         }
 
         #region Properties
