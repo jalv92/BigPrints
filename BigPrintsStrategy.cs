@@ -21,6 +21,14 @@ using NinjaTrader.NinjaScript;
 // strategy CANNOT be backtested or optimized in the Strategy Analyzer — there is no historical
 // tape to replay the aggressor logic against. It only trades while running live or in Market
 // Replay (both report State.Realtime, which the code below relies on).
+//
+// LIVE-MONEY GATE (not fixed in v1 by design) — read before enabling on a funded account:
+//   - No per-trade stop loss; only the daily USD governor (target/loss) bounds risk.
+//   - Daily PnL baseline (_dayStartRealized) resets on strategy restart, not only on a new
+//     trading day — restarting mid-session re-baselines CumProfit and can hide same-day PnL.
+//   - No account-position adoption (StartBehavior.WaitUntilFlat) — a manually-opened position
+//     on this account is invisible to this strategy.
+//   - ConnectionLossHandling left at its NT8 default — no custom reconnect/flatten policy.
 namespace NinjaTrader.NinjaScript.Strategies
 {
     public class BigPrintsStrategy : Strategy
@@ -43,6 +51,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         // --- Daily risk governor ---
         private double _dayStartRealized;
         private bool   _dailyLockout;
+        private int    _lastResetBar = -1;
+
+        // Set on EVERY Enter/Exit submission, cleared in OnExecutionUpdate once that order
+        // reaches a terminal state. Position.MarketPosition is stale until the fill confirms,
+        // and NT8's duplicate-order safety net does not cover market orders — without this gate
+        // a rapid opposite cluster (or the risk governor's per-tick retry) would double-submit.
+        private bool _orderPending;
 
         protected override void OnStateChange()
         {
@@ -53,10 +68,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Calculate                     = Calculate.OnEachTick;
                 EntriesPerDirection           = 1;
                 EntryHandling                 = EntryHandling.AllEntries;
-                IsExitOnSessionCloseStrategy  = false; // the session governor below flattens explicitly instead
+                IsExitOnSessionCloseStrategy  = true;  // safety net — CheckSessionEnd() flattens explicitly too
                 IsFillLimitOnTouch            = false;
                 StartBehavior                 = StartBehavior.WaitUntilFlat;
                 BarsRequiredToTrade           = 1;
+                IncludeCommission             = true;  // daily USD limits must be net of commission
 
                 MinVolume            = 150;
                 ClusterMilliseconds  = 150;
@@ -79,6 +95,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _clusterOpen      = false;
                 _dayStartRealized = 0;
                 _dailyLockout     = false;
+                _lastResetBar     = -1;
+                _orderPending     = false;
             }
         }
 
@@ -90,8 +108,20 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (CurrentBar < 0)
                 return;
 
-            if (Bars.IsFirstBarOfSession)
+            // IsFirstBarOfSession stays true for every tick of that bar under Calculate.OnEachTick
+            // — without the CurrentBar guard, DailyReset() would re-baseline CumProfit on every
+            // tick of the session's first bar, silently absorbing any PnL closed within it.
+            if (Bars.IsFirstBarOfSession && CurrentBar != _lastResetBar)
+            {
                 DailyReset();
+                _lastResetBar = CurrentBar;
+            }
+
+            // Stale-cluster hygiene: if the tape went quiet mid-sweep, discard the open cluster
+            // once it's clearly done (wall-clock gap since its last print exceeds the hard span
+            // cap) rather than let it linger and merge with an unrelated print far later.
+            if (_clusterOpen && (Time[0] - _clusterLastTime).TotalMilliseconds > MaxClusterSpanMs)
+                _clusterOpen = false;
 
             CheckRiskGovernor();
             CheckSessionEnd();
@@ -108,7 +138,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         private void CheckRiskGovernor()
         {
             if (_dailyLockout)
+            {
+                // Already locked out — a single ExitLong/ExitShort call isn't guaranteed to fill;
+                // keep retrying the flatten every tick until the position is actually flat.
+                if (Position.MarketPosition != MarketPosition.Flat && !_orderPending)
+                    FlattenNow("BigPrintRiskGovernor");
                 return;
+            }
             if (DailyProfitTargetUSD <= 0 && DailyLossLimitUSD <= 0)
                 return; // both disabled — nothing to compute
 
@@ -132,22 +168,36 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void CheckSessionEnd()
         {
-            if (ToTime(Time[0]) >= SessionEnd * 100 && Position.MarketPosition != MarketPosition.Flat)
+            // !InSession() also flattens correctly for an overnight (wraparound) window — no
+            // separate ">= SessionEnd" comparison needed.
+            if (!InSession(Time[0]) && Position.MarketPosition != MarketPosition.Flat)
                 FlattenNow("BigPrintSessionEnd");
         }
 
         private void FlattenNow(string signalName)
         {
+            if (_orderPending)
+                return; // an Enter/Exit is already in flight — don't stack a second submission
+
             if (Position.MarketPosition == MarketPosition.Long)
+            {
                 ExitLong(signalName);
+                _orderPending = true;
+            }
             else if (Position.MarketPosition == MarketPosition.Short)
+            {
                 ExitShort(signalName);
+                _orderPending = true;
+            }
         }
 
         private bool InSession(DateTime marketTime)
         {
-            int t = ToTime(marketTime);
-            return t >= SessionStart * 100 && t < SessionEnd * 100;
+            int t     = ToTime(marketTime);
+            int start = SessionStart * 100;
+            int end   = SessionEnd * 100;
+            // Overnight window (e.g. start 1800, end 900): session wraps midnight.
+            return start <= end ? (t >= start && t < end) : (t >= start || t < end);
         }
 
         protected override void OnMarketData(MarketDataEventArgs e)
@@ -191,7 +241,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // Opposite side, gap exceeded, or max span exceeded — finalize the open cluster, start a new one.
-            FinalizeCluster();
+            FinalizeCluster(e.Time);
 
             _clusterOpen      = true;
             _clusterIsBuy     = isBuy;
@@ -203,7 +253,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ponytail: unlike BigPrints.cs, there is no Terminated-time flush here — a strategy has
         // nothing useful to draw at teardown, and firing a trade decision off a mid-shutdown
         // cluster would be actively unwanted. An in-flight cluster at Terminated is simply dropped.
-        private void FinalizeCluster()
+        //
+        // now = the time of the print that's finalizing the cluster (may be later than the
+        // cluster's own _clusterLastTime — an opposite-side or gap-breaking print). Used both as
+        // a staleness gate and as the InSession() check's clock, since it's the freshest time we have.
+        private void FinalizeCluster(DateTime now)
         {
             if (!_clusterOpen)
                 return;
@@ -213,7 +267,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_clusterVolume < MinVolume)
                 return;
 
-            TryEnter(_clusterIsBuy, _clusterLastTime);
+            // Cold signal — the cluster's last print is too far behind "now" to still be
+            // actionable (tape went quiet, or this finalize was only triggered by a much later
+            // unrelated tick). Drop it rather than trade a stale sweep.
+            if ((now - _clusterLastTime).TotalMilliseconds > 2000)
+                return;
+
+            TryEnter(_clusterIsBuy, now);
         }
 
         // Entry / reversal logic.
@@ -227,7 +287,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // EnterShort call below, tied to the same signal name ("BigPrintLong"/"BigPrintShort").
         private void TryEnter(bool isBuy, DateTime marketTime)
         {
-            if (_dailyLockout || !InSession(marketTime))
+            if (_orderPending || _dailyLockout || !InSession(marketTime))
                 return;
 
             MarketPosition pos = Position.MarketPosition;
@@ -236,16 +296,34 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (isBuy) EnterLong(Contracts, "BigPrintLong");
                 else       EnterShort(Contracts, "BigPrintShort");
+                _orderPending = true;
             }
             else if (pos == MarketPosition.Long && !isBuy)
             {
                 EnterShort(Contracts, "BigPrintShort");
+                _orderPending = true;
             }
             else if (pos == MarketPosition.Short && isBuy)
             {
                 EnterLong(Contracts, "BigPrintLong");
+                _orderPending = true;
             }
             // else: same-direction cluster while already positioned — stay in, do nothing.
+        }
+
+        // Clears _orderPending once the in-flight order reaches a terminal state, so the next
+        // cluster signal (or the risk-governor retry) is free to submit again. Position.MarketPosition
+        // is stale until this fires, and NT8's built-in duplicate-order guard does not cover
+        // market orders — this is the gate that actually prevents double-submission.
+        protected override void OnExecutionUpdate(Execution execution, string executionId,
+            double price, int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            if (execution?.Order == null)
+                return;
+
+            OrderState state = execution.Order.OrderState;
+            if (state == OrderState.Filled || state == OrderState.Cancelled || state == OrderState.Rejected)
+                _orderPending = false;
         }
 
         #region Properties
@@ -260,8 +338,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         public int ClusterMilliseconds { get; set; }
 
         [NinjaScriptProperty]
-        [Range(1, int.MaxValue)]
-        [Display(Name = "Contracts", Description = "Quantity per entry (and per reversal leg).", Order = 3, GroupName = "Parameters")]
+        [Range(1, 20)]
+        [Display(Name = "Contracts", Description = "Quantity per entry (and per reversal leg). Capped at 20 (fat-finger guard).", Order = 3, GroupName = "Parameters")]
         public int Contracts { get; set; }
 
         [NinjaScriptProperty]
