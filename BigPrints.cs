@@ -152,8 +152,10 @@ namespace NinjaTrader.NinjaScript.Indicators
         private DispatcherTimer _elapsedTimer;
 
         private const string DefaultBasePrompt =
-@"Account size: $50,000. Max risk per trade: $500.
-Trading style: intraday futures, one position at a time, structure-based stops, no overnight positions.";
+@"Account: prop-firm evaluation; the evaluation FAILS if cumulative losses reach $2,000.
+Instrument: NQ futures, 1 contract ($20 per point).
+Risk per trade: up to $2,000 (100 NQ points) is the absolute hard ceiling available, but it is the entire evaluation - prefer the tightest structure-based stop that sits OUTSIDE bar noise (typically 15-50 points on the 1-minute chart) and only propose a wider stop when structure genuinely requires it. Flag setups needing more than 50 points of stop as elevated-risk in the rationale.
+Trading style: intraday only, one position at a time, structure-based stops, no overnight positions.";
 
         protected override void OnStateChange()
         {
