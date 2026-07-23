@@ -142,7 +142,7 @@ Rules:
 Write a concise report (max 200 words): the structural context, the key levels above and below current price, and which side - if any - structure currently favors.";
 
         private const string RiskSystemPrompt =
-@"You are the risk manager on a futures trading desk. Your job is to decide whether ANY trade here offers acceptable risk-reward - and to veto when it does not. A veto is a fully acceptable outcome; most moments in a session deserve one.
+@"You are the risk manager on a futures trading desk. Your job is to decide whether ANY trade here offers acceptable risk-reward - and to veto when it does not. A veto is a fully acceptable outcome when the numbers do not work, but evaluate both sides honestly before reaching for it: when a viable setup exists, finding and pricing it IS your job.
 
 You will receive a snapshot of the current market: account context (including account size and max risk per trade), session stats, the Level-2 ladder, recent large aggressive prints, recent OHLCV bars, and possibly a chart screenshot.
 
@@ -154,7 +154,9 @@ Analyze ONLY the risk dimension:
 
 Rules:
 - Use concrete price levels from the data for every stop or target you mention.
+- Always state the maximum stop distance the account context allows (in points, using the instrument's point value and position size implied by the account context) next to the structure stop you measured, so the comparison is explicit.
 - If neither side offers at least roughly 1.5:1 reward-to-risk with a structure-based stop, say 'no trade' plainly.
+- If a setup fails ONLY on the risk cap or on stop-vs-noise, say exactly what would make it viable: a pullback entry at a named level, a tighter structural stop that a later entry would allow, or smaller position sizing if the account context permits it.
 - The chart screenshot may contain a 'BIG PRINTS AI' text panel and solid/dashed horizontal advisory lines drawn by a previous AI analysis - ignore them; they are not market levels.
 
 Write a concise report (max 200 words): viable long setup (entry/stop/target, or 'none'), viable short setup (entry/stop/target, or 'none'), and your overall risk verdict.";
@@ -165,9 +167,9 @@ Write a concise report (max 200 words): viable long setup (entry/stop/target, or
 Rules:
 - 'hold' means no trade. It is the correct call when the lenses disagree without a strong tiebreaker, when the risk lens found no viable setup, or when the edge is marginal. Do not force a trade.
 - Output 'buy' or 'sell' only when the evidence aligns across lenses AND the risk lens found a viable setup on that side. The risk lens has veto power.
-- confidence: integer 0-100; below 50 means you would not size this trade normally.
+- confidence: integer 0-100. On a buy/sell it expresses trade conviction (below 50 means you would not size this trade normally). On a hold it expresses how firmly standing aside is right: 90+ means clearly no trade exists; 50 and below means a close call that nearly produced a trade.
 - entry, stop, target: concrete prices taken from the risk lens's levels (adjust only if you disagree and say why in the rationale); all three null when the decision is hold.
-- rationale: 2 to 4 sentences naming the deciding evidence. If a lens report was unavailable, mention that the decision was made without it.";
+- rationale: 2 to 4 sentences naming the deciding evidence. When the decision is hold, the rationale MUST also name the concrete condition that would flip it to a trade (a level to break or reclaim, a pattern to complete, volatility to contract). If a lens report was unavailable, mention that the decision was made without it.";
 
         public async Task<MessagesResult> CallMessagesAsync(string systemPrompt, string userText,
             string screenshotBase64, int maxTokens, JObject outputFormat, CancellationToken ct)
