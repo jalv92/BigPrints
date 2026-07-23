@@ -54,20 +54,28 @@ using NinjaTrader.NinjaScript;
 // OnBarUpdate for the same reason. OnMarketData must stay purely computational — read/compute
 // only, zero Enter*/AtmStrategy*/Exit* calls — forever. Latency cost of the queue is <= 1 tick.
 //
-// PLAYBACK ADVISORY (2026-07-21): NT8 8.1.8's OWN ATM-from-NinjaScript order path is a crasher
-// in Playback, not something in this file — THREE separate crash dumps (22:57, 23:04, 23:20)
-// all die inside NinjaScript.AtmStrategy.SubmitEntryOrders / the Strategy2Order SQLite write,
-// the last one AFTER the OnMarketData->OnBarUpdate threading fix above was already in place.
-// Vendor bug in NT8 8.1.8's ATM engine under Playback's compressed post-trade timing — no
-// further workaround exists on our side. RECOMMENDATION: use NATIVE mode with StopLossTicks /
-// ProfitTargetTicks (below) for Playback and testing; reserve ATM mode for live/sim accounts,
-// where the timing that triggers the bug does not occur.
+// PLAYBACK CRASH ROOT CAUSE — CORRECTED 2026-07-22 (WinDbg on 5 of the 8 crash dumps): the
+// 2026-07-21 advisory here blamed NT8's ATM engine (traces always ended at SubmitEntryOrders /
+// the Strategy2Order SQLite write), but the dumps prove otherwise — EVERY crash, from the first
+// (21st 22:57) to the last (22nd 20:01), died on the SAME native stack:
+// wdmaud!CWaveOutHandle::_ProcessData -> ucrtbase!memcpy AV on the Windows audio worker thread,
+// i.e. a use-after-free of a sound buffer inside NT8's PlaySound path (NAudio, fire-and-forget).
+// The ATM correlation was a proxy: the same big print that triggers an entry also triggers the
+// BigPrints indicator's chirp (and any NT8 order-event sounds), so death always LOOKED like an
+// order-path crash. The SQLite "bind on a busy prepared statement" error was real but non-fatal.
+// FIXES: BigPrints.cs now plays sound via winmm PlaySound P/Invoke (Windows owns the buffer);
+// keep NT8's OWN event sounds (Tools > Options > Sounds) OFF while running accelerated Playback
+// — they use the same crashy NAudio path and nothing in NinjaScript can shield them. ATM mode
+// in Playback is NOT the process-killer — but NT staff still call ATM-from-NinjaScript
+// unsupported in Playback (forum 1298259: "ATM strategies only work in realtime... use managed
+// orders instead"), so native brackets (StopLossTicks/ProfitTargetTicks) remain the recommended
+// Playback mode. The threading marshal above stays (correct per NT8 rules).
 //
 // LIVE-MONEY GATE (not fixed in v1 by design) — read before enabling on a funded account:
 //   - NATIVE mode has no per-trade stop loss unless StopLossTicks/ProfitTargetTicks are set
 //     (both 0 = disabled, the original default) — either way, the daily USD governor always
-//     applies. ATM mode gets its stop/target from the template instead — but see the PLAYBACK
-//     ADVISORY above before using ATM mode in Playback.
+//     applies. ATM mode gets its stop/target from the template instead — see the PLAYBACK
+//     CRASH ROOT CAUSE above (ATM in Playback is fine; NT8 event sounds are not).
 //   - Daily PnL baseline (_dayStartRealized / _atmRealizedPnLToday) resets on strategy restart,
 //     not only on a new trading day — restarting mid-session re-baselines and can hide same-day PnL.
 //   - No account-position adoption (StartBehavior.WaitUntilFlat) — a manually-opened position
@@ -120,7 +128,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // thread) writes; OnBarUpdate (strategy thread) reads and clears. Overwrite semantics:
         // a newer cluster replaces an undrained older one, matching "always follow the latest
         // big entry" — there is never more than 1 tick between write and drain anyway.
-        private bool     _signalQueued;
+        // volatile flag + payload-first write order in FinalizeCluster = a true flag always
+        // publishes a complete payload to the draining thread (release/acquire pairing).
+        private volatile bool _signalQueued;
         private bool     _signalIsBuy;
         private long     _signalVolume;
         private DateTime _signalTime;
@@ -178,7 +188,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // not off bar closes. The primary Bars series only supplies session/day-boundary
                 // context (Time[0], Bars.IsFirstBarOfSession) for the risk/session governor.
 
-                // Native-mode per-trade brackets (see PLAYBACK ADVISORY in the header). Must be
+                // Native-mode per-trade brackets (see PLAYBACK CRASH ROOT CAUSE in the header). Must be
                 // set here, before any entry is submitted, and tied to each entry's own signal
                 // name so the managed engine auto-attaches/replaces the bracket per entry/
                 // reversal. Naturally a no-op in ATM mode too: "BigPrintLong"/"BigPrintShort" are
@@ -219,6 +229,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _atmClosing          = false;
                 _atmReverseToBuy     = null;
                 _atmRealizedPnLToday = 0;
+
+                // Soft guardrail, not a block: NT staff call ATM-from-NinjaScript unsupported in
+                // Playback (see PLAYBACK CRASH ROOT CAUSE header) — surface it in the output
+                // window every time, since the parameter choice is easy to forget between runs.
+                if (IsAtmMode && Account != null && Account.Name.StartsWith("Playback"))
+                    Print("[BigPrints] WARNING: ATM mode on a Playback account — NT8 does not support ATM-from-NinjaScript in Playback. Prefer native mode (StopLossTicks/ProfitTargetTicks) here.");
             }
         }
 
@@ -608,10 +624,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             // Queue for OnBarUpdate instead of calling TryEnter directly here — this runs on the
             // market-data thread (see THREADING note in the header); order submissions must not.
-            _signalQueued = true;
+            // Payload BEFORE flag: _signalQueued is the volatile publish point.
             _signalIsBuy  = _clusterIsBuy;
             _signalVolume = _clusterVolume;
             _signalTime   = now;
+            _signalQueued = true;
         }
 
         // Entry / reversal logic — dispatches to the active mode.
@@ -818,6 +835,25 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (Position.MarketPosition == MarketPosition.Flat)
                     _lastFlatTime = time;
             }
+        }
+
+        // Rejected/Cancelled orders never reach OnExecutionUpdate (it fires on executions only)
+        // — without this, a no-fill terminal entry (margin rejection, manual cancel) leaves
+        // _orderPending stuck true and silently locks the strategy out for the session. Gated
+        // to OUR submitted orders by signal name: NT8's auto-cancel of a reversal's old bracket
+        // also lands here as Cancelled, and clearing on that would reopen the gate while the
+        // reversal entry itself is still in flight. NATIVE MODE ONLY (ATM = PollAtmState).
+        protected override void OnOrderUpdate(Order order, double limitPrice, double stopPrice,
+            int quantity, int filled, double averageFillPrice, OrderState orderState,
+            DateTime time, ErrorCode error, string comment)
+        {
+            if (IsAtmMode || order == null)
+                return;
+
+            if ((orderState == OrderState.Rejected || orderState == OrderState.Cancelled) &&
+                (order.Name == "BigPrintLong" || order.Name == "BigPrintShort" ||
+                 order.Name == "BigPrintRiskGovernor" || order.Name == "BigPrintSessionEnd"))
+                _orderPending = false;
         }
 
         #region Properties

@@ -23,13 +23,18 @@ using NinjaTrader.NinjaScript.DrawingTools;
 // that occur while the chart is live or replaying. No historical reconstruction is
 // attempted; that is out of scope by design (see nt8-indicator: onmarketdata caveats).
 //
-// PLAYBACK ADVISORY (2026-07-21/22): under accelerated Playback, rapid overlapping PlaySound
-// instances are implicated in NT8 native (ucrtbase) crashes — NT8's PlaySound uses NAudio's
-// AudioFileReader + WaveOutEvent, which runs OVERLAPPING async instances by default (NAudio has
-// documented native crashes from concurrent WaveOutEvent use). Our WAVs are ~0.32-0.34s; in a
-// fast Playback session, buy AND sell clusters can fire within that window, guaranteeing overlap.
-// SoundCooldownMs below throttles PlaySound to prevent that overlap. Users can additionally
-// enable Tools > Options > Sounds > "Play consecutively" to force NT8's own serialized sound queue.
+// SOUND CRASH ROOT CAUSE — VERIFIED 2026-07-22 (WinDbg on 5 of the 8 crash dumps, 2026-07-21
+// 22:57 through 2026-07-22 20:01): every NT8 Playback crash died on the SAME native stack —
+// wdmaud!CWaveOutHandle::_ProcessData -> ucrtbase!memcpy access violation on the Windows audio
+// worker thread. That is a use-after-free of a wave buffer owned by NT8's PlaySound()
+// implementation (NAudio AudioFileReader + WaveOutEvent, fire-and-forget): under Playback load
+// the managed side frees/finalizes the buffer while wdmaud is still streaming it. A cooldown
+// cannot fix another component's use-after-free — the 750ms throttle was deployed and the
+// crashes continued (2026-07-22 19:51 and 20:00). Fix: this file no longer calls NinjaScript's
+// PlaySound() at all; it P/Invokes winmm PlaySound (SND_FILENAME|SND_ASYNC), where Windows owns
+// the audio buffer and a new call safely cancels the prior sound. NOTE FOR PLAYBACK USERS: NT8's
+// OWN event sounds (order filled, alerts...) go through the same crashy NAudio path — keep
+// Tools > Options > Sounds event sounds off while running accelerated Playback.
 namespace NinjaTrader.NinjaScript.Indicators
 {
     public class BigPrints : Indicator
@@ -68,7 +73,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private Brush _buyBrush  = Brushes.Lime;
         private Brush _sellBrush = Brushes.Red;
 
-        // Sound-overlap throttle (see PLAYBACK ADVISORY above). Shared across buy AND sell — a
+        // Sound throttle (see SOUND CRASH ROOT CAUSE above). Shared across buy AND sell — a
         // buy chirp still playing when a sell fires is still two overlapping native audio
         // instances, so one counter gates both sides, not per-side counters.
         //
@@ -81,6 +86,21 @@ namespace NinjaTrader.NinjaScript.Indicators
         // TickCount wraps every ~24.9 days; `unchecked` subtraction below is wrap-safe as long
         // as the gap between two reads is under that span — always true for a sub-10s cooldown.
         private int _lastSoundTick;
+
+        // Direct winmm import — deliberately NOT NinjaScript's PlaySound() helper (see SOUND
+        // CRASH ROOT CAUSE in the header: NT8's helper is the verified process-killer in
+        // Playback). winmm loads/owns the buffer itself (SND_FILENAME) on its own thread
+        // (SND_ASYNC), and a new call cancels the previous sound inside winmm with proper
+        // locking — the managed heap never backs the audio stream, so there is nothing the
+        // GC/finalizer can free out from under wdmaud. SND_NODEFAULT = a missing file plays
+        // silence, not the Windows error ding. Fully qualified attribute (no extra usings).
+        [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "PlaySoundW",
+            CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+        private static extern bool WinmmPlaySound(string pszSound, IntPtr hmod, uint fdwSound);
+
+        private const uint SND_ASYNC     = 0x0001;
+        private const uint SND_NODEFAULT = 0x0002;
+        private const uint SND_FILENAME  = 0x00020000;
 
         protected override void OnStateChange()
         {
@@ -199,7 +219,6 @@ namespace NinjaTrader.NinjaScript.Indicators
             string textTag = "BigPrintText" + _tagCounter;
 
             Brush dotBrush = _clusterIsBuy ? _buyBrush : _sellBrush;
-            double tickOffset = TextOffsetTicks * TickSize;
 
             // Dot stays glued to the exact print: (_clusterMaxTime, _clusterPrice) — the precise
             // signal, never moved. Text is pushed clear of price action (arrow-indicator style,
@@ -209,6 +228,9 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 try
                 {
+                    // TickSize dereferences the instrument — inside the guard: it can throw on
+                    // the Terminated teardown thread just like the bar series below.
+                    double tickOffset = TextOffsetTicks * TickSize;
                     double textY;
                     try
                     {
@@ -230,6 +252,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             else
             {
                 // CurrentBar >= 0 is already guaranteed by the OnMarketData guard that led here.
+                double tickOffset = TextOffsetTicks * TickSize;
                 double textY = _clusterIsBuy ? Low[0] - tickOffset : High[0] + tickOffset;
 
                 // Stack same-bar same-side labels apart in screen pixels (scale-independent).
@@ -258,9 +281,10 @@ namespace NinjaTrader.NinjaScript.Indicators
                     dotBrush, new SimpleFont("Arial", TextSize), TextAlignment.Center, dotBrush, Brushes.Black, 70);
 
                 // Sound only on the live path — no audio alert firing during Terminated teardown.
-                // Throttled by real wall-clock time (see _lastSoundTick field comment) to prevent
-                // overlapping native PlaySound instances — a skip here is silent (no Print): it
-                // fires often in fast Playback and the dot/label above already drew regardless.
+                // Throttled by real wall-clock time (see _lastSoundTick field comment) — winmm
+                // cancels the previous sound on each new call, so without the cooldown a fast
+                // Playback tape would cut every chirp off mid-play; a skip here is silent (no
+                // Print): the dot/label above already drew regardless.
                 if (EnableSound)
                 {
                     int nowTick = Environment.TickCount;
@@ -272,7 +296,7 @@ namespace NinjaTrader.NinjaScript.Indicators
                         string fullPath = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "sounds", soundFile);
                         if (System.IO.File.Exists(fullPath))
                         {
-                            PlaySound(fullPath);
+                            WinmmPlaySound(fullPath, IntPtr.Zero, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
                             _lastSoundTick = nowTick;
                         }
                     }
@@ -323,7 +347,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         [NinjaScriptProperty]
         [Range(0, 10000)]
-        [Display(Name = "Sound Cooldown (ms)", Description = "Minimum real-time between alert sounds; prevents overlapping native audio instances which can destabilize NT8 in accelerated Playback. 750ms > the 340ms WAV length guarantees no overlap.", Order = 8, GroupName = "Parameters")]
+        [Display(Name = "Sound Cooldown (ms)", Description = "Minimum real-time between alert sounds. Each new sound cancels the previous one (winmm), so this mainly keeps a fast tape from cutting every chirp off mid-play. 750ms > the 340ms WAV length lets each chirp finish.", Order = 8, GroupName = "Parameters")]
         public int SoundCooldownMs { get; set; }
 
         [XmlIgnore]

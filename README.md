@@ -40,11 +40,19 @@ Level 1 only. No Level 2 / market depth subscription needed.
 | Contracts | 1 | Quantity per entry/reversal. Native mode only — ATM mode sizes from the template |
 | Session Start / End (HHmm) | 930 / 1555 | Entries allowed only inside this window; flattens outside it |
 | Daily Profit Target / Loss Limit (USD) | 500 / 300 | Flatten + lock out entries for the rest of the day once hit. 0 = disabled |
-| ATM Template Name | (empty) | Empty = native mode (managed orders, no per-trade stop). Set = ATM mode (SL/TP from the template) — see PLAYBACK ADVISORY in the file header before using in Playback |
+| ATM Template Name | (empty) | Empty = native mode (managed orders, no per-trade stop). Set = ATM mode (SL/TP from the template) |
 | Stop Loss / Profit Target (ticks) | 0 / 0 | Native-mode per-trade bracket. 0 = disabled, ignored in ATM mode |
 | Aggression Window (sec) | 180 | Lookback for the reversal dominance filter |
 | Reversal Dominance Ratio | 1.5 | A reversal only fires if the new side's windowed volume is at least this many times the held side's |
 | Trade Cooldown (min) | 5 | Minimum rest after a trade closes before a new entry from flat. 0 = disabled. Does not block reversals |
+
+## NT8 crash in Playback — root cause & fix (2026-07-22)
+
+Eight hard crashes of NinjaTrader 8 (whole process dies and restarts, no error dialog) over 2026-07-21/22 while running BigPrints in accelerated Playback were all the **same bug**: WinDbg analysis of 5 crash dumps shows every one dying on `wdmaud!CWaveOutHandle::_ProcessData → ucrtbase!memcpy` (access violation on the Windows audio worker thread). That is a use-after-free of a sound buffer inside **NT8's own `PlaySound()` implementation** (NAudio `WaveOutEvent`, fire-and-forget): under Playback load, the managed side frees the buffer while the audio driver is still streaming it. Order/ATM activity in the traces was a red herring — the same big print that enters a trade also fires the chirp.
+
+**Fix shipped:** the indicator now plays sounds via a direct `winmm.dll PlaySound` P/Invoke (`SND_FILENAME | SND_ASYNC` — Windows owns the buffer, a new call safely cancels the prior one). NT8's `PlaySound()` is no longer called anywhere in this repo.
+
+**Operator rule:** keep NT8's own event sounds (Tools → Options → Sounds — order filled, alerts, etc.) **disabled while running accelerated Playback** — they go through the same crashy NAudio path and cannot be shielded from NinjaScript.
 
 ## Install
 
