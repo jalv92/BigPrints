@@ -428,6 +428,36 @@ Rules:
 
         private static readonly object LogLock = new object();
 
+        // Outcome records written by the indicator's signal tracker (OnBarUpdate watches
+        // the active signal against live bars). Same JSONL; distinguished by type=outcome.
+        public static void AppendOutcome(string signalTimestamp, string decision,
+            double entry, double stop, double target, string status,
+            DateTime? filledAt, DateTime? resolvedAt, double? resolvedPrice)
+        {
+            try
+            {
+                string dir = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "BigPrintsAI");
+                System.IO.Directory.CreateDirectory(dir);
+                var rec = new JObject
+                {
+                    ["type"]           = "outcome",
+                    ["signal_ts"]      = signalTimestamp,
+                    ["decision"]       = decision,
+                    ["entry"]          = entry,
+                    ["stop"]           = stop,
+                    ["target"]         = target,
+                    ["status"]         = status,
+                    ["filled_at"]      = filledAt.HasValue ? filledAt.Value.ToString("o") : null,
+                    ["resolved_at"]    = resolvedAt.HasValue ? resolvedAt.Value.ToString("o") : null,
+                    ["resolved_price"] = resolvedPrice,
+                };
+                lock (LogLock)
+                    System.IO.File.AppendAllText(System.IO.Path.Combine(dir, "analyses.jsonl"),
+                        rec.ToString(Formatting.None) + Environment.NewLine);
+            }
+            catch (Exception) { /* outcome logging must never break anything */ }
+        }
+
         private static void AppendLog(ContextSnapshot ctx, AiVerdict verdict)
         {
             try

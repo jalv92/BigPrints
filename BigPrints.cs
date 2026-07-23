@@ -156,6 +156,27 @@ namespace NinjaTrader.NinjaScript.Indicators
         private CancellationTokenSource _aiCts;
         private bool _analysisRunning;
         private bool _lastCaptureNoScreenshot;
+        private DateTime _lastCaptureAt;
+        private double   _lastCaptureClose;
+
+        // ---- AI Advisor signal-outcome tracker ----------------------------------------
+        // Watches the active signal against live bars and logs the resolution to the
+        // JSONL automatically, so audits no longer depend on later Analyze clicks
+        // (audit #1 blind spot: signals after the session's last click were unscoreable).
+        // Armed on the UI thread (OnAnalysisComplete), read on the market-data thread
+        // (OnBarUpdate) — all mutations under _signalLock.
+        private class SignalTracker
+        {
+            public string   SignalTs;
+            public bool     IsBuy;
+            public bool     FillOnHigh;   // entry above market at signal time -> fills on High touch
+            public double   Entry, Stop, Target;
+            public bool     Filled;
+            public DateTime FilledAt;
+            public double   PostFillHigh, PostFillLow;   // tick extremes AFTER the fill only
+        }
+        private readonly object _signalLock = new object();
+        private SignalTracker _activeSignal;
         private DateTime _analysisStartedUtc;
         private Grid   _analyzeGrid;
         private Button _analyzeButton;
@@ -266,6 +287,20 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             }
             else if (State == State.Terminated)
             {
+                // Flush any live signal so no outcome is silently lost at session end.
+                lock (_signalLock)
+                {
+                    if (_activeSignal != null)
+                    {
+                        SignalTracker sig = _activeSignal;
+                        BigPrintsAiClient.AppendOutcome(sig.SignalTs, sig.IsBuy ? "buy" : "sell",
+                            sig.Entry, sig.Stop, sig.Target,
+                            sig.Filled ? "open_session_end" : "no_fill_session_end",
+                            sig.Filled ? (DateTime?)sig.FilledAt : null, DateTime.Now, null);
+                        _activeSignal = null;
+                    }
+                }
+
                 _aiCts?.Cancel();
                 _aiCts?.Dispose();
                 _aiCts = null;
@@ -324,7 +359,60 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
         }
 
         // Bar-driven work is not needed — all detection happens in OnMarketData.
-        protected override void OnBarUpdate() { }
+        protected override void OnBarUpdate()
+        {
+            // Signal-outcome tracker. Cheap fast path: unsynchronized null read is fine
+            // (reference reads are atomic; worst case is a one-tick delay after arming).
+            if (_activeSignal == null || State != State.Realtime || CurrentBar < 0)
+                return;
+
+            lock (_signalLock)
+            {
+                SignalTracker sig = _activeSignal;
+                if (sig == null)
+                    return;
+
+                // Tick-based tracking via Close[0] (latest price) ONLY. Bar extremes
+                // (High[0]/Low[0]) include pre-arm/pre-fill price action and would
+                // fabricate fills and outcomes (review finding — cf. audited signal #11,
+                // where the bar's open-side high sat beyond the target before the fill).
+                double px = Close[0];
+
+                if (!sig.Filled)
+                {
+                    bool filled = sig.FillOnHigh ? px >= sig.Entry : px <= sig.Entry;
+                    if (!filled)
+                        return;
+                    sig.Filled       = true;
+                    sig.FilledAt     = Time[0];
+                    sig.PostFillHigh = px;
+                    sig.PostFillLow  = px;
+                    // fall through: a gap-through tick can fill and resolve at once
+                }
+                else
+                {
+                    if (px > sig.PostFillHigh) sig.PostFillHigh = px;
+                    if (px < sig.PostFillLow)  sig.PostFillLow  = px;
+                }
+
+                // Stop evaluated first: if a single tick jumps through both levels,
+                // the conservative call is stop (matches the manual-audit convention).
+                bool stopHit = sig.IsBuy ? sig.PostFillLow  <= sig.Stop   : sig.PostFillHigh >= sig.Stop;
+                bool tgtHit  = sig.IsBuy ? sig.PostFillHigh >= sig.Target : sig.PostFillLow  <= sig.Target;
+                if (!stopHit && !tgtHit)
+                    return;
+
+                string status = stopHit ? "stop" : "target";
+                // ponytail: File.AppendAllText under _signalLock on the data thread — fires
+                // once per resolution, not per tick; a disk hiccup briefly stalls tick
+                // processing. Queue + background writer only if that ever measurably matters.
+                BigPrintsAiClient.AppendOutcome(sig.SignalTs, sig.IsBuy ? "buy" : "sell",
+                    sig.Entry, sig.Stop, sig.Target, status,
+                    sig.FilledAt, Time[0], stopHit ? sig.Stop : sig.Target);
+                _activeSignal = null;
+                Print("BigPrints AI: signal outcome logged — " + status);
+            }
+        }
 
         protected override void OnMarketData(MarketDataEventArgs e)
         {
@@ -629,6 +717,8 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 }
             }
             _lastCaptureNoScreenshot = EnableScreenshot && screenshotB64 == null;
+            _lastCaptureAt    = DateTime.Now;
+            _lastCaptureClose = (_bid > 0 && _ask > 0) ? (_bid + _ask) / 2.0 : 0;
 
             return new ContextSnapshot
             {
@@ -641,7 +731,7 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 BasePrompt       = LoadBasePrompt(),
                 ResponseLanguage = ResponseLanguage,
                 ScreenshotBase64 = screenshotB64,
-                CapturedAt       = DateTime.Now,
+                CapturedAt       = _lastCaptureAt,
             };
         }
 
@@ -706,6 +796,34 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                         Draw.HorizontalLine(this, "BigPrintsAiStop", false, verdict.Stop.Value, Brushes.OrangeRed, DashStyleHelper.Dash, 2);
                     if (verdict.Target.HasValue)
                         Draw.HorizontalLine(this, "BigPrintsAiTarget", false, verdict.Target.Value, Brushes.DeepSkyBlue, DashStyleHelper.Dash, 2);
+
+                    // Arm the outcome tracker; a new signal supersedes (and logs) the old one.
+                    // No inside market at capture -> cannot classify the entry side -> do not
+                    // arm (a mislabeled fill test would fabricate outcomes; review finding #3).
+                    if (verdict.Entry.HasValue && verdict.Stop.HasValue && verdict.Target.HasValue
+                        && _lastCaptureClose > 0)
+                    {
+                        lock (_signalLock)
+                        {
+                            SignalTracker old = _activeSignal;
+                            if (old != null)
+                                BigPrintsAiClient.AppendOutcome(old.SignalTs, old.IsBuy ? "buy" : "sell",
+                                    old.Entry, old.Stop, old.Target,
+                                    old.Filled ? "open_superseded" : "no_fill_superseded",
+                                    old.Filled ? (DateTime?)old.FilledAt : null, _lastCaptureAt, null);
+
+                            bool isBuy = verdict.Decision == "buy";
+                            _activeSignal = new SignalTracker
+                            {
+                                SignalTs   = _lastCaptureAt.ToString("o"),
+                                IsBuy      = isBuy,
+                                Entry      = verdict.Entry.Value,
+                                Stop       = verdict.Stop.Value,
+                                Target     = verdict.Target.Value,
+                                FillOnHigh = _lastCaptureClose > 0 && verdict.Entry.Value > _lastCaptureClose,
+                            };
+                        }
+                    }
                 }
             }
             catch (Exception) { /* teardown thread — chart may already be gone, nothing to do */ }

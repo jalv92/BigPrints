@@ -74,7 +74,10 @@ screenshot) to `claude-sonnet-5` — three parallel lens analysts (order flow,
 structure, risk) plus an orchestrator — and draws the verdict on the chart:
 BUY/SELL/HOLD, confidence, Entry/SL/TP lines. Every analysis is appended to
 `Documents/NinjaTrader 8/BigPrintsAI/analyses.jsonl` (audit trail; screenshots are
-not logged). The AI never places orders.
+not logged). Each BUY/SHORT signal is then tracked automatically against live ticks
+and its resolution (fill, stop or target, with timestamps) is appended to the same
+file as a `type: outcome` record — audits need no extra clicks. The AI never places
+orders.
 
 **Setup (one-time):**
 1. Add the JSON assembly reference — the NinjaScript compiler does NOT reference
