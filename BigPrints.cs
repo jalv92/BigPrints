@@ -87,6 +87,40 @@ namespace NinjaTrader.NinjaScript.Indicators
         // as the gap between two reads is under that span — always true for a sub-10s cooldown.
         private int _lastSoundTick;
 
+        // ---- AI Advisor data-capture layer -------------------------------------------
+        // L2 book maintained from OnMarketDepth, per NinjaTrader's own SampleLevel2Book:
+        // lists indexed by e.Position (NOT price-keyed — a Remove at position 0 shifts
+        // every lower level up, and NT sends the matching Update/Remove sequence).
+        // All mutations AND reads lock on Instrument.SyncMarketDepth — the platform's
+        // own sanctioned lock object for depth state.
+        private class LadderRow
+        {
+            public double Price;
+            public long   Volume;
+        }
+        private readonly List<LadderRow> _askRows = new List<LadderRow>(10);
+        private readonly List<LadderRow> _bidRows = new List<LadderRow>(10);
+
+        // Recent finalized big-print clusters (the ones that were drawn), bounded.
+        // Appended on the market-data thread, read on the UI thread at Analyze time.
+        private class ClusterRecord
+        {
+            public DateTime Time;
+            public bool     IsBuy;
+            public double   Price;
+            public long     Volume;
+        }
+        private readonly object _clusterMemLock = new object();
+        private readonly Queue<ClusterRecord> _recentClusters = new Queue<ClusterRecord>();
+        private const int MaxClusterMemory = 50;
+
+        // Session stats since chart load (approximation of session — honest label is
+        // applied at serialize time). Written on the market-data thread only; reads
+        // from the UI thread tolerate tearing (doubles/longs, advisory context only).
+        private long   _cumDelta;
+        private double _sessionHigh = double.MinValue;
+        private double _sessionLow  = double.MaxValue;
+
         // Direct winmm import — deliberately NOT NinjaScript's PlaySound() helper (see SOUND
         // CRASH ROOT CAUSE in the header: NT8's helper is the verified process-killer in
         // Playback). winmm loads/owns the buffer itself (SND_FILENAME) on its own thread
@@ -140,6 +174,31 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
+        protected override void OnMarketDepth(MarketDepthEventArgs e)
+        {
+            lock (e.Instrument.SyncMarketDepth)
+            {
+                List<LadderRow> rows = e.MarketDataType == MarketDataType.Ask ? _askRows : _bidRows;
+
+                if (e.Operation == Operation.Add ||
+                    (e.Operation == Operation.Update && (rows.Count == 0 || rows.Count <= e.Position)))
+                {
+                    var row = new LadderRow { Price = e.Price, Volume = e.Volume };
+                    if (rows.Count <= e.Position) rows.Add(row);
+                    else                          rows.Insert(e.Position, row);
+                }
+                else if (e.Operation == Operation.Remove && rows.Count > e.Position)
+                {
+                    rows.RemoveAt(e.Position);
+                }
+                else if (e.Operation == Operation.Update)
+                {
+                    rows[e.Position].Price  = e.Price;
+                    rows[e.Position].Volume = e.Volume;
+                }
+            }
+        }
+
         // Bar-driven work is not needed — all detection happens in OnMarketData.
         protected override void OnBarUpdate() { }
 
@@ -171,6 +230,11 @@ namespace NinjaTrader.NinjaScript.Indicators
                 isBuy = false;
             else
                 return; // print landed strictly between bid/ask — no clear aggressor, skip
+
+            // AI Advisor session stats — same thread as all other Last-print handling.
+            _cumDelta += isBuy ? e.Volume : -e.Volume;
+            if (e.Price > _sessionHigh) _sessionHigh = e.Price;
+            if (e.Price < _sessionLow)  _sessionLow  = e.Price;
 
             if (_clusterOpen &&
                 isBuy == _clusterIsBuy &&
@@ -213,6 +277,20 @@ namespace NinjaTrader.NinjaScript.Indicators
 
             if (_clusterVolume < MinVolume)
                 return;
+
+            // AI Advisor cluster memory — record every drawn cluster, bounded.
+            lock (_clusterMemLock)
+            {
+                _recentClusters.Enqueue(new ClusterRecord
+                {
+                    Time   = _clusterMaxTime,
+                    IsBuy  = _clusterIsBuy,
+                    Price  = _clusterPrice,
+                    Volume = _clusterVolume,
+                });
+                if (_recentClusters.Count > MaxClusterMemory)
+                    _recentClusters.Dequeue();
+            }
 
             _tagCounter++;
             string dotTag  = "BigPrintDot"  + _tagCounter;
@@ -310,6 +388,71 @@ namespace NinjaTrader.NinjaScript.Indicators
                 RemoveDrawObject("BigPrintDot" + oldest);
                 RemoveDrawObject("BigPrintText" + oldest);
             }
+        }
+
+        // ---- AI Advisor serializers (called on the UI thread at Analyze time) --------
+
+        internal string SerializeLadder(int maxLevels)
+        {
+            var sb = new System.Text.StringBuilder();
+            lock (Instrument.SyncMarketDepth)
+            {
+                for (int i = Math.Min(maxLevels, _askRows.Count) - 1; i >= 0; i--)
+                    sb.AppendLine("ASK " + _askRows[i].Price.ToString("F2") + " x " + _askRows[i].Volume);
+                for (int i = 0; i < Math.Min(maxLevels, _bidRows.Count); i++)
+                    sb.AppendLine("BID " + _bidRows[i].Price.ToString("F2") + " x " + _bidRows[i].Volume);
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        internal string SerializeRecentClusters(int max)
+        {
+            var sb = new System.Text.StringBuilder();
+            lock (_clusterMemLock)
+            {
+                int skip = Math.Max(0, _recentClusters.Count - max);
+                int i = 0;
+                foreach (var c in _recentClusters)
+                {
+                    if (i++ < skip) continue;
+                    sb.AppendLine(c.Time.ToString("HH:mm:ss") + " " + (c.IsBuy ? "BUY " : "SELL")
+                        + " " + c.Volume + " contracts @ " + c.Price.ToString("F2"));
+                }
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        internal string SerializeRecentBars(int count)
+        {
+            // UI-thread caller: absolute accessors only (barsAgo indexer is unsafe here).
+            var sb = new System.Text.StringBuilder();
+            try
+            {
+                if (CurrentBar < 0)
+                    return "bar data unavailable";
+                int first = Math.Max(0, CurrentBar - count + 1);
+                for (int idx = first; idx <= CurrentBar; idx++)
+                {
+                    sb.AppendLine(Bars.GetTime(idx).ToString("HH:mm")
+                        + " O:" + Bars.GetOpen(idx).ToString("F2")
+                        + " H:" + Bars.GetHigh(idx).ToString("F2")
+                        + " L:" + Bars.GetLow(idx).ToString("F2")
+                        + " C:" + Bars.GetClose(idx).ToString("F2")
+                        + " V:" + Bars.GetVolume(idx));
+                }
+            }
+            catch (Exception) { return "bar data unavailable"; }
+            return sb.ToString().TrimEnd();
+        }
+
+        internal string SerializeSessionStats()
+        {
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("cumulative delta since chart load: " + _cumDelta + " contracts (buy-aggressor minus sell-aggressor)");
+            if (_sessionHigh > double.MinValue)
+                sb.AppendLine("high/low since chart load: " + _sessionHigh.ToString("F2") + " / " + _sessionLow.ToString("F2"));
+            sb.AppendLine("current inside market: bid " + _bid.ToString("F2") + " / ask " + _ask.ToString("F2"));
+            return sb.ToString().TrimEnd();
         }
 
         #region Properties
