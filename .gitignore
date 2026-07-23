@@ -1,0 +1,2 @@
+# Secrets — never commit (auto-sync hook does git add on every session start)
+doc/
