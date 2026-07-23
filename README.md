@@ -65,3 +65,21 @@ Copy `BigPrints.cs` to `Documents\NinjaTrader 8\bin\Custom\Indicators\`, then co
 ## Development
 
 Compiled outside NT8 with [nt8c](https://github.com/jalv92) (Roslyn parity with the NinjaScript Editor).
+
+## AI Advisor
+
+Manual decision support: an **Analyze** button on the chart sends the current market
+context (L2 ladder, recent big-print clusters, recent bars, session stats, chart
+screenshot) to `claude-sonnet-5` — three parallel lens analysts (order flow,
+structure, risk) plus an orchestrator — and draws the verdict on the chart:
+BUY/SELL/HOLD, confidence, Entry/SL/TP lines. Every analysis is appended to
+`Documents/NinjaTrader 8/BigPrintsAI/analyses.jsonl` (audit trail; screenshots are
+not logged). The AI never places orders.
+
+**Setup:** put your Anthropic API key (the key only, one line) in
+`Documents/NinjaTrader 8/claude_api_key.txt` (or change the *API Key File Path*
+parameter). Edit *Base Prompt* with your account size and max risk per trade.
+
+**Cost:** ~$0.11 per click at claude-sonnet-5 intro pricing (~$0.17 after 2026-08-31).
+Requires an L2 data feed for the ladder (analysis still runs without it).
+Design: `docs/specs/2026-07-23-ai-advisor-design.md`.
