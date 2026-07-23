@@ -101,7 +101,10 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
 
         private const int LensMaxTokens         = 8000;
-        private const int OrchestratorMaxTokens = 6000;
+        // 8000, not 6000: adaptive thinking shares this budget with the JSON verdict —
+        // a heavy-context click burned all 6000 in thinking + a long rationale and the
+        // JSON got truncated mid-string (analyses.jsonl #13, 2026-07-23).
+        private const int OrchestratorMaxTokens = 8000;
 
         private const string OrderFlowSystemPrompt =
 @"You are an order-flow analyst on a futures trading desk. You read the tape and the limit-order book.
@@ -175,7 +178,7 @@ Rules:
 - Never invent a setup that is not priced in the lens reports. When the entry is a limit or trigger level rather than market, say so in the rationale (e.g. 'limit at X on retest' or 'on break of X').
 - confidence: integer 0-100. On a buy/sell it expresses trade conviction (below 50 means you would not size this trade normally). On a hold it expresses how firmly standing aside is right: 90+ means clearly no trade exists; 50 and below means a close call that nearly produced a trade.
 - entry, stop, target: concrete prices taken from the risk lens's levels (adjust only if you disagree and say why in the rationale); all three null when the decision is hold.
-- rationale: 2 to 5 sentences naming the deciding evidence. When the decision is hold and a viable CONDITIONAL setup exists in the lens reports, the rationale MUST give the contingent plan: side, trigger level, stop, and target with approximate R:R (e.g. 'plan: LONG on a retest-and-hold of X, stop Y, target Z, ~2.5R'). If no such setup exists, name the concrete condition that would flip the decision (a level to break or reclaim, a pattern to complete, volatility to contract). Prefer structural levels over round numbers for triggers. If a lens report was unavailable, mention that the decision was made without it.";
+- rationale: 2 to 5 sentences, MAXIMUM 700 characters, plain prose only - no quotation marks, no braces, no trailing punctuation runs. Name the deciding evidence. When the decision is hold and a viable CONDITIONAL setup exists in the lens reports, the rationale MUST give the contingent plan: side, trigger level, stop, and target with approximate R:R (e.g. 'plan: LONG on a retest-and-hold of X, stop Y, target Z, ~2.5R'). If no such setup exists, name the concrete condition that would flip the decision (a level to break or reclaim, a pattern to complete, volatility to contract). Prefer structural levels over round numbers for triggers. If a lens report was unavailable, mention that the decision was made without it.";
 
         public async Task<MessagesResult> CallMessagesAsync(string systemPrompt, string userText,
             string screenshotBase64, int maxTokens, JObject outputFormat, CancellationToken ct)
@@ -385,6 +388,7 @@ Rules:
 
             if (or_.Error != null)      { verdict.Error = "orchestrator failed: " + or_.Error; AppendLog(ctx, verdict); return verdict; }
             if (or_.StopReason == "refusal") { verdict.Error = "orchestrator refused"; AppendLog(ctx, verdict); return verdict; }
+            if (or_.StopReason == "max_tokens") { verdict.Error = "orchestrator hit its token limit (truncated verdict) — click Analyze again"; AppendLog(ctx, verdict); return verdict; }
 
             try
             {
