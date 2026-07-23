@@ -145,6 +145,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private BigPrintsAiClient _aiClient;
         private CancellationTokenSource _aiCts;
         private bool _analysisRunning;
+        private bool _lastCaptureNoScreenshot;
         private DateTime _analysisStartedUtc;
         private Grid   _analyzeGrid;
         private Button _analyzeButton;
@@ -272,6 +273,9 @@ Trading style: intraday futures, one position at a time, structure-based stops, 
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
         {
+            if (!EnableAiAdvisor)
+                return;
+
             lock (e.Instrument.SyncMarketDepth)
             {
                 List<LadderRow> rows = e.MarketDataType == MarketDataType.Ask ? _askRows : _bidRows;
@@ -494,6 +498,11 @@ Trading style: intraday futures, one position at a time, structure-based stops, 
         {
             if (_analysisRunning)
                 return;
+
+            CancellationTokenSource cts = _aiCts;
+            if (cts == null || State == State.Terminated)
+                return;
+
             if (_aiClient == null)
             {
                 DrawAiPanel("AI: API key not loaded\ncheck 'API Key File Path' parameter", Brushes.Orange);
@@ -507,7 +516,7 @@ Trading style: intraday futures, one position at a time, structure-based stops, 
             DrawAiPanel("Analyzing... 0s", Brushes.Gainsboro);
 
             ContextSnapshot ctx = CaptureContext();
-            CancellationToken ct = _aiCts.Token;
+            CancellationToken ct = cts.Token;
 
             Task.Run(async () =>
             {
@@ -526,6 +535,11 @@ Trading style: intraday futures, one position at a time, structure-based stops, 
 
         private void OnElapsedTick(object sender, EventArgs e)
         {
+            if (State == State.Terminated)
+                return;
+            if (!_analysisRunning)
+                return;
+
             int secs = (int)(DateTime.UtcNow - _analysisStartedUtc).TotalSeconds;
             DrawAiPanel("Analyzing... " + secs + "s", Brushes.Gainsboro);
         }
@@ -562,6 +576,7 @@ Trading style: intraday futures, one position at a time, structure-based stops, 
                     Print("BigPrints AI: screenshot failed, sending without image — " + ex.Message);
                 }
             }
+            _lastCaptureNoScreenshot = EnableScreenshot && screenshotB64 == null;
 
             return new ContextSnapshot
             {
@@ -580,45 +595,57 @@ Trading style: intraday futures, one position at a time, structure-based stops, 
 
         private void OnAnalysisComplete(AiVerdict verdict)
         {
+            if (State == State.Terminated)
+                return;
+
             _elapsedTimer?.Stop();
             _analysisRunning = false;
             if (_analyzeButton != null)
                 _analyzeButton.IsEnabled = true;
 
-            RemoveDrawObject("BigPrintsAiEntry");
-            RemoveDrawObject("BigPrintsAiStop");
-            RemoveDrawObject("BigPrintsAiTarget");
-
-            if (verdict.Error != null)
+            // bestEffort try/catch mirroring FinalizeCluster: this runs off a queued dispatcher
+            // delegate, which can still fire after Terminated tears the chart down (NT8 does not
+            // wrap exceptions in user-posted dispatcher delegates) — swallow, nothing to do.
+            try
             {
-                DrawAiPanel("AI ERROR\n" + WrapText(verdict.Error, 60), Brushes.Orange);
-                return;
-            }
+                RemoveDrawObject("BigPrintsAiEntry");
+                RemoveDrawObject("BigPrintsAiStop");
+                RemoveDrawObject("BigPrintsAiTarget");
 
-            Brush decisionBrush =
-                verdict.Decision == "buy"  ? Brushes.Lime :
-                verdict.Decision == "sell" ? Brushes.Red  : Brushes.Silver;
+                if (verdict.Error != null)
+                {
+                    DrawAiPanel("AI ERROR\n" + WrapText(verdict.Error, 60), Brushes.Orange);
+                    return;
+                }
 
-            var sb = new System.Text.StringBuilder();
-            sb.AppendLine("BIG PRINTS AI  " + DateTime.Now.ToString("HH:mm:ss"));
-            sb.AppendLine(verdict.Decision.ToUpper() + "  (confidence " + verdict.Confidence + ")");
-            if (verdict.Entry.HasValue)
-                sb.AppendLine("Entry " + verdict.Entry.Value.ToString("F2")
-                    + " | Stop " + (verdict.Stop.HasValue ? verdict.Stop.Value.ToString("F2") : "-")
-                    + " | Target " + (verdict.Target.HasValue ? verdict.Target.Value.ToString("F2") : "-"));
-            sb.AppendLine(WrapText(verdict.Rationale ?? "", 60));
-            sb.Append("tokens " + verdict.InputTokens + " in / " + verdict.OutputTokens + " out");
-            DrawAiPanel(sb.ToString(), decisionBrush);
+                Brush decisionBrush =
+                    verdict.Decision == "buy"  ? Brushes.Lime :
+                    verdict.Decision == "sell" ? Brushes.Red  : Brushes.Silver;
 
-            if (verdict.Decision == "buy" || verdict.Decision == "sell")
-            {
+                var sb = new System.Text.StringBuilder();
+                sb.AppendLine("BIG PRINTS AI  " + DateTime.Now.ToString("HH:mm:ss"));
+                sb.AppendLine(verdict.Decision.ToUpper() + "  (confidence " + verdict.Confidence + ")");
                 if (verdict.Entry.HasValue)
-                    Draw.HorizontalLine(this, "BigPrintsAiEntry", false, verdict.Entry.Value, decisionBrush, DashStyleHelper.Solid, 2);
-                if (verdict.Stop.HasValue)
-                    Draw.HorizontalLine(this, "BigPrintsAiStop", false, verdict.Stop.Value, Brushes.OrangeRed, DashStyleHelper.Dash, 2);
-                if (verdict.Target.HasValue)
-                    Draw.HorizontalLine(this, "BigPrintsAiTarget", false, verdict.Target.Value, Brushes.DeepSkyBlue, DashStyleHelper.Dash, 2);
+                    sb.AppendLine("Entry " + verdict.Entry.Value.ToString("F2")
+                        + " | Stop " + (verdict.Stop.HasValue ? verdict.Stop.Value.ToString("F2") : "-")
+                        + " | Target " + (verdict.Target.HasValue ? verdict.Target.Value.ToString("F2") : "-"));
+                sb.AppendLine(WrapText(verdict.Rationale ?? "", 60));
+                if (_lastCaptureNoScreenshot)
+                    sb.AppendLine("(no screenshot — analysis ran without chart image)");
+                sb.Append("tokens " + verdict.InputTokens + " in / " + verdict.OutputTokens + " out");
+                DrawAiPanel(sb.ToString(), decisionBrush);
+
+                if (verdict.Decision == "buy" || verdict.Decision == "sell")
+                {
+                    if (verdict.Entry.HasValue)
+                        Draw.HorizontalLine(this, "BigPrintsAiEntry", false, verdict.Entry.Value, decisionBrush, DashStyleHelper.Solid, 2);
+                    if (verdict.Stop.HasValue)
+                        Draw.HorizontalLine(this, "BigPrintsAiStop", false, verdict.Stop.Value, Brushes.OrangeRed, DashStyleHelper.Dash, 2);
+                    if (verdict.Target.HasValue)
+                        Draw.HorizontalLine(this, "BigPrintsAiTarget", false, verdict.Target.Value, Brushes.DeepSkyBlue, DashStyleHelper.Dash, 2);
+                }
             }
+            catch (Exception) { /* teardown thread — chart may already be gone, nothing to do */ }
 
             if (!string.IsNullOrEmpty(AnalysisSoundFile))
             {

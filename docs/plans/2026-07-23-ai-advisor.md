@@ -12,8 +12,13 @@
 
 - **.NET Framework 4.8, NT8 sandbox.** No NuGet packages, no new DLL references. Only assemblies NT8 already loads (Newtonsoft.Json is one of them). The official Anthropic C# SDK is BANNED (verified assembly-version collision with NT8's pinned `System.Text.Json` et al.).
 - **Explicit `using` directives always** — `nt8c check` per-file does not catch missing cross-namespace usings (known trap); write every using explicitly, fully-qualify on collisions (existing file already does `System.IO.Path` for this reason).
-- **Compile validation:** the PostToolUse hook runs `nt8c check <file>` on every edit — fix any CS error before proceeding. Each task ends with the cross-file staged build:
-  `nt8c build --custom-dir "/home/javlo/Code Projects/main-project/projects/Trading/BigPrints" --out /tmp/bigprints-staged.dll` → expected exit 0.
+- **Compile validation:** the PostToolUse hook runs `nt8c check <file>` on every edit — fix any CS error before proceeding. Each task ends with the cross-file staged build (`--custom-dir` requires the NT8 Custom folder layout — stage first):
+  ```bash
+  rm -rf /tmp/bigprints-staging && mkdir -p /tmp/bigprints-staging/Indicators /tmp/bigprints-staging/Strategies
+  cp BigPrints.cs BigPrintsAiClient.cs /tmp/bigprints-staging/Indicators/ && cp BigPrintsStrategy.cs /tmp/bigprints-staging/Strategies/
+  nt8c build --custom-dir /tmp/bigprints-staging --out /tmp/bigprints-staged.dll
+  ```
+  → expected exit 0.
 - **No runtime test harness exists for NinjaScript.** Per-task cycle = compile validation + code review; runtime verification is consolidated in Task 5 (Market Replay + failure drills). This is the plan's sanctioned deviation from strict TDD.
 - **Threading:** never block the market-data thread (`OnMarketData`/`OnMarketDepth` only append to locked, bounded structures). UI work only via `ChartControl.Dispatcher.InvokeAsync` (never synchronous `.Invoke`). The button `Click` handler runs on the UI thread. Bar reads outside market-data events use absolute accessors (`Bars.GetClose(idx)`), never the `barsAgo` indexer.
 - **Sound:** only the existing winmm P/Invoke path. NT8's `PlaySound()` is BANNED in this repo (verified use-after-free crash — see BigPrints.cs header).

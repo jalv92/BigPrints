@@ -119,6 +119,7 @@ Rules:
 - Base every claim on the data provided. If a signal is not present in the data, do not invent it.
 - If the ladder says 'L2 data unavailable', say so and reason from the tape alone.
 - Note data limitations explicitly rather than guessing.
+- The chart screenshot may contain a 'BIG PRINTS AI' text panel and solid/dashed horizontal advisory lines drawn by a previous AI analysis - ignore them; they are not market levels.
 
 Write a concise report (max 200 words): the dominant order-flow read, the key evidence (cite specific prices and volumes from the data), and which side - if any - order flow currently favors.";
 
@@ -136,6 +137,7 @@ Analyze ONLY the structure dimension:
 Rules:
 - Base every claim on the data provided; cite specific prices from the bars or session stats.
 - If the bar data and the screenshot disagree, trust the bar data and say so.
+- The chart screenshot may contain a 'BIG PRINTS AI' text panel and solid/dashed horizontal advisory lines drawn by a previous AI analysis - ignore them; they are not market levels.
 
 Write a concise report (max 200 words): the structural context, the key levels above and below current price, and which side - if any - structure currently favors.";
 
@@ -153,6 +155,7 @@ Analyze ONLY the risk dimension:
 Rules:
 - Use concrete price levels from the data for every stop or target you mention.
 - If neither side offers at least roughly 1.5:1 reward-to-risk with a structure-based stop, say 'no trade' plainly.
+- The chart screenshot may contain a 'BIG PRINTS AI' text panel and solid/dashed horizontal advisory lines drawn by a previous AI analysis - ignore them; they are not market levels.
 
 Write a concise report (max 200 words): viable long setup (entry/stop/target, or 'none'), viable short setup (entry/stop/target, or 'none'), and your overall risk verdict.";
 
@@ -214,7 +217,8 @@ Rules:
                             string apiMsg = null;
                             try { apiMsg = (string)JObject.Parse(raw)?["error"]?["message"]; }
                             catch (Exception) { /* non-JSON error body — fall through to raw */ }
-                            return new MessagesResult { Error = "HTTP " + (int)resp.StatusCode + ": " + (apiMsg ?? raw) };
+                            string rawFallback = raw.Length > 300 ? raw.Substring(0, 300) + "..." : raw;
+                            return new MessagesResult { Error = "HTTP " + (int)resp.StatusCode + ": " + (apiMsg ?? rawFallback) };
                         }
 
                         var json = JObject.Parse(raw);
@@ -389,6 +393,12 @@ Rules:
             {
                 verdict.Decision = "error";
                 verdict.Error    = "verdict parse failed: " + ex.Message;
+            }
+
+            if (verdict.Decision == null)
+            {
+                verdict.Decision = "error";
+                verdict.Error    = "verdict missing decision field";
             }
 
             AppendLog(ctx, verdict);

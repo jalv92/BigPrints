@@ -15,7 +15,7 @@ Built for ES futures; works on any instrument with a live tape.
 
 ## Data requirements
 
-Level 1 only. No Level 2 / market depth subscription needed.
+Level 1 for the detector (the sweep/cluster logic runs entirely off `OnMarketData`). Level 2 (market depth) is used by the AI Advisor's ladder when available — the analysis still runs without it.
 
 **Real-time and Market Replay only** — `OnMarketData` does not fire on historical data, so nothing is drawn on a freshly loaded historical chart. This is by design.
 
@@ -56,7 +56,7 @@ Eight hard crashes of NinjaTrader 8 (whole process dies and restarts, no error d
 
 ## Install
 
-Copy `BigPrints.cs` to `Documents\NinjaTrader 8\bin\Custom\Indicators\`, then compile in NT8 (NinjaScript Editor → F5). Add "BigPrints" to a chart.
+Copy both `BigPrints.cs` and `BigPrintsAiClient.cs` to `Documents\NinjaTrader 8\bin\Custom\Indicators\` (the indicator references the AI client class — copying only one breaks the F5 compile), then compile in NT8 (NinjaScript Editor → F5). Add "BigPrints" to a chart.
 
 ## Recommended timeframe
 
