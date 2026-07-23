@@ -3,8 +3,13 @@ using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using System.Xml.Serialization;
 using NinjaTrader.Cbi;
 using NinjaTrader.Data;
@@ -136,6 +141,19 @@ namespace NinjaTrader.NinjaScript.Indicators
         private const uint SND_NODEFAULT = 0x0002;
         private const uint SND_FILENAME  = 0x00020000;
 
+        // ---- AI Advisor UX -----------------------------------------------------------
+        private BigPrintsAiClient _aiClient;
+        private CancellationTokenSource _aiCts;
+        private bool _analysisRunning;
+        private DateTime _analysisStartedUtc;
+        private Grid   _analyzeGrid;
+        private Button _analyzeButton;
+        private DispatcherTimer _elapsedTimer;
+
+        private const string DefaultBasePrompt =
+@"Account size: $50,000. Max risk per trade: $500.
+Trading style: intraday futures, one position at a time, structure-based stops, no overnight positions.";
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -155,6 +173,19 @@ namespace NinjaTrader.NinjaScript.Indicators
                 BuySoundFile        = "BigPrintBuy.wav";
                 SellSoundFile       = "BigPrintSell.wav";
                 SoundCooldownMs     = 750; // > the ~340ms WAV length, guarantees no overlap
+
+                EnableAiAdvisor      = true;
+                ApiKeyFilePath       = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "claude_api_key.txt");
+                ModelId              = "claude-sonnet-5";
+                BasePrompt           = DefaultBasePrompt;
+                ResponseLanguage     = "English";
+                EnableScreenshot     = true;
+                DomLevelsToSend      = 10;
+                RecentClustersToSend = 20;
+                BarsToSend           = 30;
+                AnalysisSoundFile    = "";
             }
             else if (State == State.Configure)
             {
@@ -165,9 +196,74 @@ namespace NinjaTrader.NinjaScript.Indicators
                 _bid = 0;
                 _ask = 0;
                 _clusterOpen = false;
+
+                if (EnableAiAdvisor)
+                {
+                    _aiCts = new CancellationTokenSource();
+                    string key = BigPrintsAiClient.LoadApiKey(ApiKeyFilePath);
+                    if (key != null)
+                        _aiClient = new BigPrintsAiClient(key, ModelId);
+                    else
+                        Print("BigPrints AI: API key file not found or empty at '" + ApiKeyFilePath + "' — Analyze disabled.");
+                }
+            }
+            else if (State == State.Historical)
+            {
+                if (!EnableAiAdvisor || ChartControl == null)
+                    return;
+
+                ChartControl.Dispatcher.InvokeAsync(new Action(() =>
+                {
+                    // Duplicate guard — the lifecycle can re-enter Historical on the same instance.
+                    if (_analyzeGrid != null && UserControlCollection.Contains(_analyzeGrid))
+                        return;
+
+                    _analyzeGrid = new Grid
+                    {
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                        VerticalAlignment   = VerticalAlignment.Bottom,
+                        Margin              = new Thickness(0, 0, 12, 32),
+                    };
+                    _analyzeButton = new Button
+                    {
+                        Content    = "Analyze",
+                        Padding    = new Thickness(10, 4, 10, 4),
+                        Foreground = Brushes.White,
+                        Background = Brushes.DarkSlateGray, // predefined brush — thread-safe, no Freeze needed
+                    };
+                    _analyzeButton.Click += OnAnalyzeClick;
+                    _analyzeGrid.Children.Add(_analyzeButton);
+                    UserControlCollection.Add(_analyzeGrid);
+
+                    _elapsedTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+                    _elapsedTimer.Tick += OnElapsedTick;
+                }));
             }
             else if (State == State.Terminated)
             {
+                _aiCts?.Cancel();
+                _aiCts?.Dispose();
+                _aiCts = null;
+
+                if (ChartControl != null)
+                {
+                    ChartControl.Dispatcher.InvokeAsync(new Action(() =>
+                    {
+                        _elapsedTimer?.Stop();
+                        if (_analyzeButton != null)
+                        {
+                            _analyzeButton.Click -= OnAnalyzeClick;
+                            _analyzeGrid?.Children.Remove(_analyzeButton);
+                            _analyzeButton = null;
+                        }
+                        if (_analyzeGrid != null)
+                        {
+                            UserControlCollection.Remove(_analyzeGrid);
+                            _analyzeGrid = null;
+                        }
+                    }));
+                }
+
                 // Flush whatever sweep was mid-cluster when the chart/session ended — otherwise
                 // the very last (often largest) print of the session never gets drawn.
                 FinalizeCluster(true);
@@ -390,6 +486,170 @@ namespace NinjaTrader.NinjaScript.Indicators
             }
         }
 
+        // ---- AI Advisor: click → capture → pipeline → render -------------------------
+        // Click fires on the ChartControl UI thread (WPF routed event) — capture and
+        // screenshot run here directly; only the HTTP pipeline goes to Task.Run.
+
+        private void OnAnalyzeClick(object sender, RoutedEventArgs e)
+        {
+            if (_analysisRunning)
+                return;
+            if (_aiClient == null)
+            {
+                DrawAiPanel("AI: API key not loaded\ncheck 'API Key File Path' parameter", Brushes.Orange);
+                return;
+            }
+
+            _analysisRunning    = true;
+            _analysisStartedUtc = DateTime.UtcNow;
+            _analyzeButton.IsEnabled = false;
+            _elapsedTimer.Start();
+            DrawAiPanel("Analyzing... 0s", Brushes.Gainsboro);
+
+            ContextSnapshot ctx = CaptureContext();
+            CancellationToken ct = _aiCts.Token;
+
+            Task.Run(async () =>
+            {
+                AiVerdict verdict;
+                try
+                {
+                    verdict = await _aiClient.AnalyzeAsync(ctx, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    verdict = new AiVerdict { Decision = "error", Error = ex.Message };
+                }
+                ChartControl?.Dispatcher.InvokeAsync(new Action(() => OnAnalysisComplete(verdict)));
+            });
+        }
+
+        private void OnElapsedTick(object sender, EventArgs e)
+        {
+            int secs = (int)(DateTime.UtcNow - _analysisStartedUtc).TotalSeconds;
+            DrawAiPanel("Analyzing... " + secs + "s", Brushes.Gainsboro);
+        }
+
+        private ContextSnapshot CaptureContext()
+        {
+            string screenshotB64 = null;
+            if (EnableScreenshot)
+            {
+                try
+                {
+                    // NT8-internal API (same mechanism as the Share feature). Works only
+                    // when this chart tab is active — always true on a manual click.
+                    // GetScreenshot(NinjaTrader.NinjaScript.ShareScreenshotType, FrameworkElement) — the
+                    // enum lives in NinjaTrader.Core under NinjaTrader.NinjaScript (already `using`d
+                    // above), not NinjaTrader.Gui.Chart; the second argument is the element to capture.
+                    var chartWindow = System.Windows.Window.GetWindow(ChartControl) as NinjaTrader.Gui.Chart.Chart;
+                    var bmp = chartWindow == null ? null
+                        : chartWindow.GetScreenshot(ShareScreenshotType.Chart, ChartControl);
+                    if (bmp != null)
+                    {
+                        bmp.Freeze();
+                        using (var ms = new System.IO.MemoryStream())
+                        {
+                            var enc = new PngBitmapEncoder();
+                            enc.Frames.Add(BitmapFrame.Create(bmp));
+                            enc.Save(ms);
+                            screenshotB64 = Convert.ToBase64String(ms.ToArray());
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Print("BigPrints AI: screenshot failed, sending without image — " + ex.Message);
+                }
+            }
+
+            return new ContextSnapshot
+            {
+                Instrument       = Instrument.FullName,
+                ChartTimeframe   = BarsPeriod.ToString(),
+                LadderText       = SerializeLadder(DomLevelsToSend),
+                ClustersText     = SerializeRecentClusters(RecentClustersToSend),
+                BarsText         = SerializeRecentBars(BarsToSend),
+                SessionText      = SerializeSessionStats(),
+                BasePrompt       = BasePrompt,
+                ResponseLanguage = ResponseLanguage,
+                ScreenshotBase64 = screenshotB64,
+                CapturedAt       = DateTime.Now,
+            };
+        }
+
+        private void OnAnalysisComplete(AiVerdict verdict)
+        {
+            _elapsedTimer?.Stop();
+            _analysisRunning = false;
+            if (_analyzeButton != null)
+                _analyzeButton.IsEnabled = true;
+
+            RemoveDrawObject("BigPrintsAiEntry");
+            RemoveDrawObject("BigPrintsAiStop");
+            RemoveDrawObject("BigPrintsAiTarget");
+
+            if (verdict.Error != null)
+            {
+                DrawAiPanel("AI ERROR\n" + WrapText(verdict.Error, 60), Brushes.Orange);
+                return;
+            }
+
+            Brush decisionBrush =
+                verdict.Decision == "buy"  ? Brushes.Lime :
+                verdict.Decision == "sell" ? Brushes.Red  : Brushes.Silver;
+
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("BIG PRINTS AI  " + DateTime.Now.ToString("HH:mm:ss"));
+            sb.AppendLine(verdict.Decision.ToUpper() + "  (confidence " + verdict.Confidence + ")");
+            if (verdict.Entry.HasValue)
+                sb.AppendLine("Entry " + verdict.Entry.Value.ToString("F2")
+                    + " | Stop " + (verdict.Stop.HasValue ? verdict.Stop.Value.ToString("F2") : "-")
+                    + " | Target " + (verdict.Target.HasValue ? verdict.Target.Value.ToString("F2") : "-"));
+            sb.AppendLine(WrapText(verdict.Rationale ?? "", 60));
+            sb.Append("tokens " + verdict.InputTokens + " in / " + verdict.OutputTokens + " out");
+            DrawAiPanel(sb.ToString(), decisionBrush);
+
+            if (verdict.Decision == "buy" || verdict.Decision == "sell")
+            {
+                if (verdict.Entry.HasValue)
+                    Draw.HorizontalLine(this, "BigPrintsAiEntry", false, verdict.Entry.Value, decisionBrush, DashStyleHelper.Solid, 2);
+                if (verdict.Stop.HasValue)
+                    Draw.HorizontalLine(this, "BigPrintsAiStop", false, verdict.Stop.Value, Brushes.OrangeRed, DashStyleHelper.Dash, 2);
+                if (verdict.Target.HasValue)
+                    Draw.HorizontalLine(this, "BigPrintsAiTarget", false, verdict.Target.Value, Brushes.DeepSkyBlue, DashStyleHelper.Dash, 2);
+            }
+
+            if (!string.IsNullOrEmpty(AnalysisSoundFile))
+            {
+                string fullPath = System.IO.Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "sounds", AnalysisSoundFile);
+                if (System.IO.File.Exists(fullPath))
+                    WinmmPlaySound(fullPath, IntPtr.Zero, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+            }
+        }
+
+        private void DrawAiPanel(string text, Brush brush)
+        {
+            Draw.TextFixed(this, "BigPrintsAiPanel", text, TextPosition.TopRight,
+                brush, new SimpleFont("Consolas", 12), Brushes.Transparent, Brushes.Black, 60);
+        }
+
+        // TextFixed does not word-wrap — insert newlines at word boundaries.
+        private static string WrapText(string text, int width)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            var sb = new System.Text.StringBuilder();
+            int lineLen = 0;
+            foreach (string word in text.Split(' '))
+            {
+                if (lineLen + word.Length + 1 > width) { sb.Append('\n'); lineLen = 0; }
+                else if (lineLen > 0)                  { sb.Append(' ');  lineLen++; }
+                sb.Append(word);
+                lineLen += word.Length;
+            }
+            return sb.ToString();
+        }
+
         // ---- AI Advisor serializers (called on the UI thread at Analyze time) --------
 
         internal string SerializeLadder(int maxLevels)
@@ -522,6 +782,49 @@ namespace NinjaTrader.NinjaScript.Indicators
             get { return Serialize.BrushToString(SellBrush); }
             set { SellBrush = Serialize.StringToBrush(value); }
         }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable AI Advisor", Description = "Master switch for the Analyze button and AI analysis.", Order = 20, GroupName = "AI Advisor")]
+        public bool EnableAiAdvisor { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "API Key File Path", Description = "Text file containing ONLY the Anthropic API key. The key itself is never stored in the indicator.", Order = 21, GroupName = "AI Advisor")]
+        public string ApiKeyFilePath { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Model Id", Description = "Anthropic model id used for all calls.", Order = 22, GroupName = "AI Advisor")]
+        public string ModelId { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Base Prompt", Description = "Account context sent to the AI: account size, max risk per trade, style. English recommended.", Order = 23, GroupName = "AI Advisor")]
+        public string BasePrompt { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Response Language", Description = "Language of the rationale shown on the chart.", Order = 24, GroupName = "AI Advisor")]
+        public string ResponseLanguage { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Send Chart Screenshot", Description = "Attach a screenshot of this chart to the analysis.", Order = 25, GroupName = "AI Advisor")]
+        public bool EnableScreenshot { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 10)]
+        [Display(Name = "DOM Levels To Send", Description = "L2 ladder depth per side.", Order = 26, GroupName = "AI Advisor")]
+        public int DomLevelsToSend { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 50)]
+        [Display(Name = "Recent Clusters To Send", Description = "How many recent big-print clusters to include.", Order = 27, GroupName = "AI Advisor")]
+        public int RecentClustersToSend { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(5, 200)]
+        [Display(Name = "Bars To Send", Description = "How many recent bars (OHLCV) to include.", Order = 28, GroupName = "AI Advisor")]
+        public int BarsToSend { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Analysis Sound File", Description = "WAV in the NT8 sounds folder played when an analysis completes. Empty = silent.", Order = 29, GroupName = "AI Advisor")]
+        public string AnalysisSoundFile { get; set; }
         #endregion
     }
 }
