@@ -182,7 +182,9 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                     Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
                     "NinjaTrader 8", "claude_api_key.txt");
                 ModelId              = "claude-sonnet-5";
-                BasePrompt           = DefaultBasePrompt;
+                BasePromptFilePath   = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "NinjaTrader 8", "bigprints_base_prompt.txt");
                 ResponseLanguage     = "English";
                 EnableScreenshot     = true;
                 DomLevelsToSend      = 10;
@@ -208,6 +210,15 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                         _aiClient = new BigPrintsAiClient(key, ModelId);
                     else
                         Print("BigPrints AI: API key file not found or empty at '" + ApiKeyFilePath + "' — Analyze disabled.");
+
+                    // Seed the base-prompt file with the default template on first run so
+                    // the trader has something concrete to edit (see LoadBasePrompt).
+                    try
+                    {
+                        if (!System.IO.File.Exists(BasePromptFilePath))
+                            System.IO.File.WriteAllText(BasePromptFilePath, DefaultBasePrompt);
+                    }
+                    catch (Exception ex) { Print("BigPrints AI: could not seed base prompt file — " + ex.Message); }
                 }
             }
             else if (State == State.Historical)
@@ -546,6 +557,21 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             DrawAiPanel("Analyzing... " + secs + "s", Brushes.Gainsboro);
         }
 
+        // Read fresh on every Analyze click so the trader can edit the file mid-session.
+        // Lives in a file because the NT8 property grid is single-line and rejects
+        // multiline pastes (same pattern as the API key file).
+        private string LoadBasePrompt()
+        {
+            try
+            {
+                string text = System.IO.File.ReadAllText(BasePromptFilePath).Trim();
+                if (text.Length > 0)
+                    return text;
+            }
+            catch (Exception) { /* fall through to the built-in default */ }
+            return DefaultBasePrompt;
+        }
+
         private ContextSnapshot CaptureContext()
         {
             string screenshotB64 = null;
@@ -588,7 +614,7 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 ClustersText     = SerializeRecentClusters(RecentClustersToSend),
                 BarsText         = SerializeRecentBars(BarsToSend),
                 SessionText      = SerializeSessionStats(),
-                BasePrompt       = BasePrompt,
+                BasePrompt       = LoadBasePrompt(),
                 ResponseLanguage = ResponseLanguage,
                 ScreenshotBase64 = screenshotB64,
                 CapturedAt       = DateTime.Now,
@@ -825,8 +851,8 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
         public string ModelId { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Base Prompt", Description = "Account context sent to the AI: account size, max risk per trade, style. English recommended.", Order = 23, GroupName = "AI Advisor")]
-        public string BasePrompt { get; set; }
+        [Display(Name = "Base Prompt File Path", Description = "Text file with the account context sent to the AI (account, instrument, max risk per trade). Edit it in any text editor - it is re-read on every Analyze click. Created with a default template on first run. The NT8 property grid cannot hold multiline text, which is why this lives in a file.", Order = 23, GroupName = "AI Advisor")]
+        public string BasePromptFilePath { get; set; }
 
         [NinjaScriptProperty]
         [Display(Name = "Response Language", Description = "Language of the rationale shown on the chart.", Order = 24, GroupName = "AI Advisor")]

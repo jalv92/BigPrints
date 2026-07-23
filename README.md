@@ -84,7 +84,11 @@ not logged). The AI never places orders.
 2. Put your Anthropic API key (the key only, one line) in
    `Documents/NinjaTrader 8/claude_api_key.txt` (or change the *API Key File Path*
    parameter).
-3. Edit *Base Prompt* with your account size and max risk per trade.
+3. Edit `Documents/NinjaTrader 8/bigprints_base_prompt.txt` with your account,
+   instrument, and max risk per trade (created with a default template on first
+   run; re-read on every Analyze click, so you can tune it mid-session). The
+   *Base Prompt File Path* parameter points to it — the NT8 property grid cannot
+   hold multiline text, which is why the prompt lives in a file.
 
 **Cost:** ~$0.11 per click at claude-sonnet-5 intro pricing (~$0.17 after 2026-08-31).
 Requires an L2 data feed for the ladder (analysis still runs without it).
