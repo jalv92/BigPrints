@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **.NET Framework 4.8, NT8 sandbox.** No NuGet packages, no new DLL references. Only assemblies NT8 already loads (Newtonsoft.Json is one of them). The official Anthropic C# SDK is BANNED (verified assembly-version collision with NT8's pinned `System.Text.Json` et al.).
+- **.NET Framework 4.8, NT8 sandbox.** No NuGet packages. Only assemblies NT8 itself ships. The official Anthropic C# SDK is BANNED (verified assembly-version collision with NT8's pinned `System.Text.Json` et al.). **CORRECTION (post-mortem 2026-07-23):** Newtonsoft.Json ships in NT8's `bin/` but the NinjaScript compiler does NOT reference it by default — it requires a one-time manual reference in the NinjaScript Editor (References… → Add → `C:\Program Files\NinjaTrader 8\bin\Newtonsoft.Json.dll`), mirrored into nt8c's refs cache. The original claim "zero references to add" was wrong; nt8c's first failing build was a true positive that got masked by patching the tool's cache instead of adding the Editor reference.
 - **Explicit `using` directives always** — `nt8c check` per-file does not catch missing cross-namespace usings (known trap); write every using explicitly, fully-qualify on collisions (existing file already does `System.IO.Path` for this reason).
 - **Compile validation:** the PostToolUse hook runs `nt8c check <file>` on every edit — fix any CS error before proceeding. Each task ends with the cross-file staged build (`--custom-dir` requires the NT8 Custom folder layout — stage first):
   ```bash

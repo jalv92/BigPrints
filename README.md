@@ -76,9 +76,15 @@ BUY/SELL/HOLD, confidence, Entry/SL/TP lines. Every analysis is appended to
 `Documents/NinjaTrader 8/BigPrintsAI/analyses.jsonl` (audit trail; screenshots are
 not logged). The AI never places orders.
 
-**Setup:** put your Anthropic API key (the key only, one line) in
-`Documents/NinjaTrader 8/claude_api_key.txt` (or change the *API Key File Path*
-parameter). Edit *Base Prompt* with your account size and max risk per trade.
+**Setup (one-time):**
+1. Add the JSON assembly reference — the NinjaScript compiler does NOT reference
+   Newtonsoft by default even though NT8 ships it: NinjaScript Editor → right-click →
+   **References...** → **Add** → `C:\Program Files\NinjaTrader 8\bin\Newtonsoft.Json.dll`.
+   Without this, compilation fails with CS0246 on `Newtonsoft`.
+2. Put your Anthropic API key (the key only, one line) in
+   `Documents/NinjaTrader 8/claude_api_key.txt` (or change the *API Key File Path*
+   parameter).
+3. Edit *Base Prompt* with your account size and max risk per trade.
 
 **Cost:** ~$0.11 per click at claude-sonnet-5 intro pricing (~$0.17 after 2026-08-31).
 Requires an L2 data feed for the ladder (analysis still runs without it).
