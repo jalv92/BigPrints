@@ -252,7 +252,15 @@ Rules:
             }
             catch (OperationCanceledException)
             {
-                return new MessagesResult { Error = "cancelled" };
+                // Disambiguate for the log: ct fires on State.Terminated (chart closed,
+                // indicator reloaded, F5 recompile); HttpClient.Timeout throws the same
+                // exception type but without our token being cancelled.
+                return new MessagesResult
+                {
+                    Error = ct.IsCancellationRequested
+                        ? "cancelled (chart closed or indicator reloaded mid-analysis)"
+                        : "timed out (no API response within 180s)"
+                };
             }
             catch (Exception ex)
             {
