@@ -123,6 +123,16 @@ namespace NinjaTrader.NinjaScript.Indicators
         // applied at serialize time). Written on the market-data thread only; reads
         // from the UI thread tolerate tearing (doubles/longs, advisory context only).
         private long   _cumDelta;
+
+        // Rolling delta: per-minute buckets so the AI gets a recent-flow signal whose
+        // anchor is NOT the arbitrary chart-load time (the session cum-delta's flaw:
+        // the same tape gave -135 or +262 depending on when the chart was loaded).
+        // Written on the market-data thread, read on the UI thread at Analyze time.
+        private class DeltaBucket { public DateTime Minute; public long Delta; }
+        private readonly object _deltaLock = new object();
+        private readonly Queue<DeltaBucket> _deltaBuckets = new Queue<DeltaBucket>();
+        private DeltaBucket _currentDeltaBucket;
+        private DateTime _lastTapeTime;
         private double _sessionHigh = double.MinValue;
         private double _sessionLow  = double.MaxValue;
 
@@ -191,6 +201,7 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 RecentClustersToSend = 20;
                 BarsToSend           = 30;
                 AnalysisSoundFile    = "";
+                ShowFullAnalysis     = false;
             }
             else if (State == State.Configure)
             {
@@ -346,6 +357,19 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
 
             // AI Advisor session stats — same thread as all other Last-print handling.
             _cumDelta += isBuy ? e.Volume : -e.Volume;
+            lock (_deltaLock)
+            {
+                DateTime minute = new DateTime(e.Time.Year, e.Time.Month, e.Time.Day, e.Time.Hour, e.Time.Minute, 0);
+                if (_currentDeltaBucket == null || _currentDeltaBucket.Minute != minute)
+                {
+                    _currentDeltaBucket = new DeltaBucket { Minute = minute };
+                    _deltaBuckets.Enqueue(_currentDeltaBucket);
+                    while (_deltaBuckets.Count > 15)   // keep ~15 min; 10 used at serialize time
+                        _deltaBuckets.Dequeue();
+                }
+                _currentDeltaBucket.Delta += isBuy ? e.Volume : -e.Volume;
+                _lastTapeTime = e.Time;
+            }
             if (e.Price > _sessionHigh) _sessionHigh = e.Price;
             if (e.Price < _sessionLow)  _sessionLow  = e.Price;
 
@@ -648,20 +672,31 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
 
                 Brush decisionBrush =
                     verdict.Decision == "buy"  ? Brushes.Lime :
-                    verdict.Decision == "sell" ? Brushes.Red  : Brushes.Silver;
+                    verdict.Decision == "sell" ? Brushes.Red  : Brushes.Gray;
+                string decisionWord = verdict.Decision == "sell" ? "SHORT" : verdict.Decision.ToUpper();
 
-                var sb = new System.Text.StringBuilder();
-                sb.AppendLine("BIG PRINTS AI  " + DateTime.Now.ToString("HH:mm:ss"));
-                sb.AppendLine(verdict.Decision.ToUpper() + "  (confidence " + verdict.Confidence + ")");
-                if (verdict.Entry.HasValue)
-                    sb.AppendLine("Entry " + verdict.Entry.Value.ToString("F2")
-                        + " | Stop " + (verdict.Stop.HasValue ? verdict.Stop.Value.ToString("F2") : "-")
-                        + " | Target " + (verdict.Target.HasValue ? verdict.Target.Value.ToString("F2") : "-"));
-                sb.AppendLine(WrapText(verdict.Rationale ?? "", 60));
-                if (_lastCaptureNoScreenshot)
-                    sb.AppendLine("(no screenshot — analysis ran without chart image)");
-                sb.Append("tokens " + verdict.InputTokens + " in / " + verdict.OutputTokens + " out");
-                DrawAiPanel(sb.ToString(), decisionBrush);
+                if (ShowFullAnalysis)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    sb.AppendLine("BIG PRINTS AI  " + DateTime.Now.ToString("HH:mm:ss"));
+                    sb.AppendLine(decisionWord + "  (confidence " + verdict.Confidence + ")");
+                    if (verdict.Entry.HasValue)
+                        sb.AppendLine("Entry " + verdict.Entry.Value.ToString("F2")
+                            + " | Stop " + (verdict.Stop.HasValue ? verdict.Stop.Value.ToString("F2") : "-")
+                            + " | Target " + (verdict.Target.HasValue ? verdict.Target.Value.ToString("F2") : "-"));
+                    sb.AppendLine(WrapText(verdict.Rationale ?? "", 60));
+                    if (_lastCaptureNoScreenshot)
+                        sb.AppendLine("(no screenshot — analysis ran without chart image)");
+                    sb.Append("tokens " + verdict.InputTokens + " in / " + verdict.OutputTokens + " out");
+                    DrawAiPanel(sb.ToString(), decisionBrush);
+                }
+                else
+                {
+                    // Minimal display by request: just the action. Full reasoning stays
+                    // in the JSONL log for auditing; levels are drawn as lines below.
+                    DrawAiPanel(DateTime.Now.ToString("HH:mm:ss") + "  " + decisionWord
+                        + "  (" + verdict.Confidence + ")", decisionBrush, 22);
+                }
 
                 if (verdict.Decision == "buy" || verdict.Decision == "sell")
                 {
@@ -683,10 +718,10 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             }
         }
 
-        private void DrawAiPanel(string text, Brush brush)
+        private void DrawAiPanel(string text, Brush brush, int fontSize = 12)
         {
             Draw.TextFixed(this, "BigPrintsAiPanel", text, TextPosition.TopRight,
-                brush, new SimpleFont("Consolas", 12), Brushes.Transparent, Brushes.Black, 60);
+                brush, new SimpleFont("Consolas", fontSize), Brushes.Transparent, Brushes.Black, 60);
         }
 
         // TextFixed does not word-wrap — insert newlines at word boundaries.
@@ -763,7 +798,23 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
         internal string SerializeSessionStats()
         {
             var sb = new System.Text.StringBuilder();
-            sb.AppendLine("cumulative delta since chart load: " + _cumDelta + " contracts (buy-aggressor minus sell-aggressor)");
+            long rolling10 = 0;
+            bool haveTape = false;
+            lock (_deltaLock)
+            {
+                if (_lastTapeTime != default(DateTime))
+                {
+                    haveTape = true;
+                    DateTime cutoff = _lastTapeTime.AddMinutes(-10);
+                    foreach (DeltaBucket b in _deltaBuckets)
+                        if (b.Minute >= cutoff)
+                            rolling10 += b.Delta;
+                }
+            }
+            sb.AppendLine(haveTape
+                ? "rolling 10-minute delta: " + rolling10 + " contracts (recent aggressor flow - primary flow signal)"
+                : "rolling 10-minute delta: unavailable");
+            sb.AppendLine("cumulative delta since chart load: " + _cumDelta + " contracts (background context only - its anchor is the arbitrary chart-load time)");
             if (_sessionHigh > double.MinValue)
                 sb.AppendLine("high/low since chart load: " + _sessionHigh.ToString("F2") + " / " + _sessionLow.ToString("F2"));
             sb.AppendLine("current inside market: bid " + _bid.ToString("F2") + " / ask " + _ask.ToString("F2"));
@@ -880,6 +931,10 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
         [NinjaScriptProperty]
         [Display(Name = "Analysis Sound File", Description = "WAV in the NT8 sounds folder played when an analysis completes. Empty = silent.", Order = 29, GroupName = "AI Advisor")]
         public string AnalysisSoundFile { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Show Full Analysis", Description = "Off (default): the panel shows only BUY/SHORT/HOLD with confidence. On: full rationale, levels and token usage on the panel. The JSONL log always keeps the full analysis either way.", Order = 30, GroupName = "AI Advisor")]
+        public bool ShowFullAnalysis { get; set; }
         #endregion
     }
 }
