@@ -338,9 +338,22 @@ Rules:
                 lensBlock.AppendLine("</" + lr.Lens + ">");
             }
 
+            // Sum lens tokens (all paths need this).
+            foreach (LensReport lr in reports)
+            {
+                verdict.InputTokens  += lr.InputTokens;
+                verdict.OutputTokens += lr.OutputTokens;
+            }
+
             if (surviving == 0)
             {
-                verdict.Error = "all three lens calls failed: " + reports[0].Error;
+                var failedErrors = new StringBuilder();
+                for (int i = 0; i < reports.Length; i++)
+                {
+                    if (i > 0) failedErrors.Append("; ");
+                    failedErrors.Append(reports[i].Lens).Append(": ").Append(reports[i].Error);
+                }
+                verdict.Error = "all three lens calls failed: " + failedErrors.ToString();
                 AppendLog(ctx, verdict);
                 return verdict;
             }
@@ -354,12 +367,7 @@ Rules:
             MessagesResult or_ = await CallMessagesAsync(OrchestratorSystemPrompt, orchestratorUser,
                 null, OrchestratorMaxTokens, VerdictFormat, ct).ConfigureAwait(false);
 
-            // Usage totals = 3 lenses + orchestrator, recorded even on orchestrator failure.
-            foreach (LensReport lr in reports)
-            {
-                verdict.InputTokens  += lr.InputTokens;
-                verdict.OutputTokens += lr.OutputTokens;
-            }
+            // Add orchestrator tokens to the total (lenses already summed above).
             verdict.InputTokens  += or_.InputTokens;
             verdict.OutputTokens += or_.OutputTokens;
 
