@@ -103,42 +103,42 @@ namespace NinjaTrader.NinjaScript.Indicators
         public async Task<MessagesResult> CallMessagesAsync(string systemPrompt, string userText,
             string screenshotBase64, int maxTokens, JObject outputFormat, CancellationToken ct)
         {
-            var content = new JArray();
-            if (!string.IsNullOrEmpty(screenshotBase64))
-            {
-                content.Add(new JObject
-                {
-                    ["type"]   = "image",
-                    ["source"] = new JObject
-                    {
-                        ["type"]       = "base64",
-                        ["media_type"] = "image/png",
-                        ["data"]       = screenshotBase64,
-                    },
-                });
-            }
-            content.Add(new JObject { ["type"] = "text", ["text"] = userText });
-
-            var body = new JObject
-            {
-                ["model"]      = _modelId,
-                ["max_tokens"] = maxTokens,
-                ["system"]     = systemPrompt,
-                ["messages"]   = new JArray
-                {
-                    new JObject { ["role"] = "user", ["content"] = content },
-                },
-                // No temperature/top_p/top_k (rejected by claude-sonnet-5);
-                // no thinking field (adaptive is the model default).
-            };
-            if (outputFormat != null)
-                body["output_config"] = new JObject { ["format"] = outputFormat };
-
             try
             {
+                var content = new JArray();
+                if (!string.IsNullOrEmpty(screenshotBase64))
+                {
+                    content.Add(new JObject
+                    {
+                        ["type"]   = "image",
+                        ["source"] = new JObject
+                        {
+                            ["type"]       = "base64",
+                            ["media_type"] = "image/png",
+                            ["data"]       = screenshotBase64,
+                        },
+                    });
+                }
+                content.Add(new JObject { ["type"] = "text", ["text"] = userText });
+
+                var body = new JObject
+                {
+                    ["model"]      = _modelId,
+                    ["max_tokens"] = maxTokens,
+                    ["system"]     = systemPrompt,
+                    ["messages"]   = new JArray
+                    {
+                        new JObject { ["role"] = "user", ["content"] = content },
+                    },
+                    // No temperature/top_p/top_k (rejected by claude-sonnet-5);
+                    // no thinking field (adaptive is the model default).
+                };
+                if (outputFormat != null)
+                    body["output_config"] = new JObject { ["format"] = outputFormat };
+
                 using (var req = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages"))
                 {
-                    req.Headers.Add("x-api-key", _apiKey);
+                    req.Headers.TryAddWithoutValidation("x-api-key", _apiKey);
                     req.Content = new StringContent(body.ToString(Formatting.None), Encoding.UTF8, "application/json");
                     using (var resp = await Http.SendAsync(req, ct).ConfigureAwait(false))
                     {
