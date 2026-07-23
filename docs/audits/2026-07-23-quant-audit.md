@@ -36,9 +36,14 @@ evaluación de $2,000 en la 5ª-6ª señal.**
    razón** ("stops dentro del ruido de barra"). El giro a "más agresivo" quitó ese freno y
    esta cinta cobró la matrícula completa. En régimen de volatilidad extrema, aquellos HOLD
    eran información, no cobardía.
-3. **La confianza ya lo estaba avisando**: todas las perdedoras salieron con 55-65. Ni una
-   señal ≥70 en toda la sesión. Un filtro de confianza ≥70 habría tomado CERO trades — el
-   resultado correcto para esta cinta.
+3. **La confianza — dato sugerente pero NO concluyente**: todas las perdedoras salieron con
+   55-65 y un filtro ≥70 habría tomado cero trades. PERO no hubo ganadoras en la muestra
+   (0/6), así que cualquier filtro restrictivo "habría evitado las pérdidas" — el dato no
+   prueba que la confianza discrimine. Además, en todo el log el modelo nunca ha emitido
+   una señal de trade >65 (las confianzas altas, 80/65, fueron de holds): si la escala vive
+   comprimida en 55-65 para trades, un umbral ≥70 sería un apagado, no un filtro. Queda en
+   observación para la próxima auditoría (¿discrimina entre ganadoras y perdedoras? ¿cruza
+   alguna vez 70 en cinta normal?).
 4. Nota a favor del motor de niveles: #7 y #14 eran ideas direccionales correctas (el precio
    acabó yendo a la zona del target) — murieron por timing/stop en el squeeze, no por lado.
 
@@ -58,8 +63,10 @@ evaluación de $2,000 en la 5ª-6ª señal.**
   quedar ≥1.5× el rango medio de las últimas 10 velas; si con eso ningún nivel cercano da
   R:R ≥1.5, el hold es correcto y viene justificado por números del régimen.
 - **B (regla de ejecución del trader, sin código):** operar solo señales con confianza ≥70.
-  Respaldada por esta sesión (habría filtrado el 100% de las pérdidas).
-- **C:** A + B combinadas (defensa en dos capas: el modelo veta régimen imposible, el trader
-  filtra convicción baja).
+  **NO validada aún** — sin ganadoras en la muestra el dato es trivial, y el modelo nunca ha
+  emitido >65 en un trade (posible escala comprimida). No adoptar hasta que la próxima
+  auditoría muestre que la confianza discrimina.
+- **C:** A ahora + confianza en observación; activar B después solo si los datos de la
+  siguiente auditoría la respaldan, con umbral elegido por datos.
 
 Próxima auditoría: tras ~10 señales en régimen de volatilidad normal.
