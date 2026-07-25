@@ -1155,12 +1155,14 @@ Design: `docs/specs/2026-07-23-ai-advisor-design.md`.
 - [ ] **Step 3: Deploy to NT8**
 
 ```bash
-cp "/home/javlo/Code Projects/main-project/projects/Trading/BigPrints/BigPrints.cs" \
-   "/home/javlo/Code Projects/main-project/projects/Trading/BigPrints/BigPrintsAiClient.cs" \
-   "/mnt/c/Users/javlo/Documents/NinjaTrader 8/bin/Custom/Indicators/"
-tr -d '\r\n' < "/home/javlo/Code Projects/main-project/projects/Trading/BigPrints/doc/Anthropic Key.txt" \
-   > "/mnt/c/Users/javlo/Documents/NinjaTrader 8/claude_api_key.txt"
+REPO="$(git rev-parse --show-toplevel)"
+NT8="/mnt/c/Users/$USER/Documents/NinjaTrader 8"
+cp "$REPO/BigPrints.cs" "$REPO/BigPrintsAiClient.cs" "$NT8/bin/Custom/Indicators/"
 ```
+
+The API key is NOT part of the deploy: it lives only in `$NT8/claude_api_key.txt`
+(one line, key only) and never inside this repo. If that file is missing, create it
+by hand once — the indicator reads it at load and logs a clear message when absent.
 
 Then (human step): NT8 Editor → F5 compile. Expected: clean compile.
 

@@ -1,5 +1,12 @@
-# Secrets — never commit (auto-sync hook does git add on every session start)
+# Secrets — never commit (auto-sync hook does git add on every session start).
+# The API key does NOT live here: it lives in Documents/NinjaTrader 8/claude_api_key.txt.
+# These patterns are a net for anything that lands with a different name.
 doc/
+.env
+.env.*
+*.key
+*.pem
+*key*.txt
 
 # Session/process scratch (SDD ledgers, briefs, review diffs) — never commit
 .superpowers/
