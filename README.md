@@ -2,10 +2,10 @@
 
 NinjaTrader 8 indicator + strategy pair built on large aggressive market orders (buy/sell sweeps) detected from the Level 1 tape.
 
-- **BigPrints.cs** (indicator) — marks each sweep on the chart at the exact price it printed, with the swept contract count and a sound alert.
-- **BigPrintsStrategy.cs** (strategy) — trades in the aggressor's direction: enters on a qualifying sweep, reverses in one step when an opposite sweep fires mid-trade, governed by a session window and daily profit/loss limits in USD. **No per-trade stop in v1** — daily limits only. Real-time / Market Replay only; cannot be backtested in the Strategy Analyzer (no historical tape).
+- **BigPrints.cs** (indicator) — marks each sweep on the chart at the exact price it printed, with the swept contract count and a sound alert. Optionally includes an **AI Advisor**: a manual Analyze button that sends the current market context to Claude and draws a BUY/SELL/HOLD verdict with entry, stop and target on the chart.
+- **BigPrintsStrategy.cs** (strategy) — trades in the aggressor's direction: enters on a qualifying sweep, reverses in one step when an opposite sweep fires mid-trade, governed by a session window and daily profit/loss limits in USD. Real-time / Market Replay only; **cannot be backtested in the Strategy Analyzer** (no historical tape).
 
-Built for ES futures; works on any instrument with a live tape.
+Developed and tested on **NQ** futures; works on any instrument with a live tape.
 
 ## What it does
 
@@ -13,25 +13,117 @@ Built for ES futures; works on any instrument with a live tape.
 - Reconstructs sweeps: consecutive same-side prints within `Cluster Milliseconds` (default 150 ms) are folded into one cluster, so a single 300-lot order that swept 3 price levels counts as one 300-contract entry, not three small ones.
 - When a finished cluster totals `Min Volume` contracts or more (default **150**), it draws a dot at the anchor price (the largest print of the sweep) plus a text label with the total contract count — green for buyers, red for sellers.
 
-## Data requirements
+## Requirements
 
-Level 1 for the detector (the sweep/cluster logic runs entirely off `OnMarketData`). Level 2 (market depth) is used by the AI Advisor's ladder when available — the analysis still runs without it.
+### Software
 
-**Real-time and Market Replay only** — `OnMarketData` does not fire on historical data, so nothing is drawn on a freshly loaded historical chart. This is by design.
+- **NinjaTrader 8** (any recent build).
+- A data feed that provides **Level 1 tape** (time & sales) for the instrument you chart. Every broker/data feed supported by NT8 provides this — Rithmic, CQG, Kinetick, Interactive Brokers, NinjaTrader Brokerage, etc.
+- **Level 2 (market depth / DOM)** is *optional*. It is only used by the AI Advisor to build the order-book ladder; the analysis still runs without it, and the sweep detector never needs it.
 
-## Parameters
+### Data type — read this before you wonder why nothing is drawn
+
+The detection runs entirely inside `OnMarketData`, which **only fires on live ticks**. That means:
+
+| Mode | Works? |
+|---|---|
+| **Real-time** (connected to a live data feed, market open) | ✅ Yes |
+| **Market Replay** (Control Center → Connections → Playback, replay data downloaded) | ✅ Yes |
+| **Historical chart** (any bar type, loaded from stored data) | ❌ Nothing is drawn — by design |
+| **Strategy Analyzer backtest** | ❌ Not supported — there is no historical tape to replay |
+
+If you load a chart on a Saturday, or scroll back to yesterday, the chart will be blank. That is not a bug. To test outside market hours, use **Market Replay**: in NT8, Tools → Historical Data → Load, download the Market Replay data for the days you want, then connect to the Playback connection and run the chart there.
+
+Bar type and timeframe do not affect detection — the logic runs on the tape, not on bars. See [Recommended timeframe](#recommended-timeframe).
+
+## Install
+
+### 1. Copy the source files
+
+Three files, **two different folders** — the strategy does *not* go in the Indicators folder:
+
+| File | Destination |
+|---|---|
+| `BigPrints.cs` | `Documents\NinjaTrader 8\bin\Custom\Indicators\` |
+| `BigPrintsAiClient.cs` | `Documents\NinjaTrader 8\bin\Custom\Indicators\` |
+| `BigPrintsStrategy.cs` | `Documents\NinjaTrader 8\bin\Custom\Strategies\` |
+
+`BigPrints.cs` references the `BigPrintsAiClient` class, so copying only one of the two breaks the compile. The strategy is standalone and does not depend on either.
+
+If you only want the indicator, skip `BigPrintsStrategy.cs`. If you only want the strategy, you still need all three files present or NT8 will not compile the folder.
+
+### 2. Copy the alert sounds
+
+Copy both files from `sounds/` to `Documents\NinjaTrader 8\sounds\`:
+
+- `BigPrintBuy.wav` — ascending double ping (buy sweep)
+- `BigPrintSell.wav` — descending two-tone chirp (sell sweep)
+
+**This step is silent if you skip it.** A missing WAV does not raise an error — the indicator just plays nothing, which looks exactly like "no sweeps detected". If you prefer no sound at all, set the `Enable Sound` parameter to false instead of omitting the files.
+
+(The WAVs are 44.1 kHz / 16-bit mono, ~340 ms, generated by `tools/make_sounds.py` — stdlib Python, no dependencies. Regenerate or replace them freely; just keep the file names or update the `Buy Sound File` / `Sell Sound File` parameters.)
+
+### 3. Add the JSON reference — only if you want the AI Advisor
+
+Skip this step if you are not using the AI Advisor; the sweep detector and the strategy do not need it.
+
+NT8 ships `Newtonsoft.Json.dll` but the NinjaScript compiler does **not** reference it by default. In NT8: **New → NinjaScript Editor → right-click anywhere in the editor → References... → Add →**
+
+```
+C:\Program Files\NinjaTrader 8\bin\Newtonsoft.Json.dll
+```
+
+Without this, compilation fails with `CS0246: The type or namespace name 'Newtonsoft' could not be found`.
+
+### 4. Compile
+
+In the NinjaScript Editor, press **F5**. All three files compile together.
+
+### 5. Add to a chart
+
+- **Indicator:** right-click a chart → Indicators → `BigPrints` → OK.
+- **Strategy:** right-click a chart → Strategies → `BigPrintsStrategy` → set your parameters → Enabled.
+
+Connect to a live feed or the Playback connection and you will see marks appear as sweeps print.
+
+## Recommended timeframe
+
+A **1-minute chart** works well for live monitoring. Detection itself is timeframe-independent — it runs on the tape, not on bars — the timeframe only affects how the marks are spaced horizontally and how much history fits on screen.
+
+## Parameters — indicator (`BigPrints.cs`)
+
+### Detection and display
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | Min Volume | 150 | Minimum total contracts in a sweep cluster to draw it |
 | Cluster Milliseconds | 150 | Max gap between same-side prints to still count as one sweep |
 | Text Size | 14 | Font size of the contract-count label |
-| Buy Brush / Sell Brush | Lime / Red | Cluster colors |
 | Text Offset Ticks | 10 | Distance of the count label from the bar's high/low |
 | Enable Sound | true | Play an alert sound on each drawn cluster |
-| Buy/Sell Sound File | BigPrintBuy.wav / BigPrintSell.wav | Custom chirps (ascending = buy, descending = sell); generated by `tools/make_sounds.py`, deployed to `Documents\NinjaTrader 8\sounds\` |
+| Buy Sound File | BigPrintBuy.wav | WAV name in the NT8 `sounds` folder, played on a buy cluster |
+| Sell Sound File | BigPrintSell.wav | WAV name in the NT8 `sounds` folder, played on a sell cluster |
+| Sound Cooldown (ms) | 750 | Minimum real time between alert sounds. 750 ms > the ~340 ms WAV length, so each chirp finishes instead of being cut off by the next |
+| Buy Brush | Lime | Color for buy-aggressor clusters |
+| Sell Brush | Red | Color for sell-aggressor clusters |
 
-## Strategy parameters (BigPrintsStrategy.cs)
+### AI Advisor
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| Enable AI Advisor | true | Master switch for the Analyze button and AI analysis |
+| API Key File Path | `Documents\NinjaTrader 8\claude_api_key.txt` | Text file containing **only** the Anthropic API key. The key is never stored in the indicator or its workspace template |
+| Model Id | claude-sonnet-5 | Anthropic model id used for all calls |
+| Base Prompt File Path | `Documents\NinjaTrader 8\bigprints_base_prompt.txt` | Your account context (account, instrument, max risk). Created with a default template on first run, re-read on every Analyze click |
+| Response Language | English | Language of the rationale drawn on the chart |
+| Send Chart Screenshot | true | Attach a screenshot of the chart to the analysis |
+| DOM Levels To Send | 10 | L2 ladder depth per side (requires an L2 feed; ignored if unavailable) |
+| Recent Clusters To Send | 20 | How many recent big-print clusters to include in the context |
+| Bars To Send | 30 | How many recent bars (OHLCV) to include in the context |
+| Analysis Sound File | *(empty)* | WAV in the NT8 `sounds` folder played when an analysis completes. Empty = silent |
+| Show Full Analysis | false | Off: the panel shows only BUY/SHORT/HOLD with confidence. On: full rationale, levels and token usage. The JSONL log always keeps the full analysis either way |
+
+## Parameters — strategy (`BigPrintsStrategy.cs`)
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -39,60 +131,69 @@ Level 1 for the detector (the sweep/cluster logic runs entirely off `OnMarketDat
 | Cluster Milliseconds | 150 | Max gap between same-side prints to still count as one sweep |
 | Contracts | 1 | Quantity per entry/reversal. Native mode only — ATM mode sizes from the template |
 | Session Start / End (HHmm) | 930 / 1555 | Entries allowed only inside this window; flattens outside it |
-| Daily Profit Target / Loss Limit (USD) | 500 / 300 | Flatten + lock out entries for the rest of the day once hit. 0 = disabled |
-| ATM Template Name | (empty) | Empty = native mode (managed orders, no per-trade stop). Set = ATM mode (SL/TP from the template) |
-| Stop Loss / Profit Target (ticks) | 0 / 0 | Native-mode per-trade bracket. 0 = disabled, ignored in ATM mode |
+| Daily Profit Target / Loss Limit (USD) | 500 / 300 | Flatten + lock out entries for the rest of the day once hit. 0 = disabled. Net of commission |
+| ATM Template Name | *(empty)* | Empty = native mode (managed orders). Set = ATM mode (SL/TP come from the template) |
+| Stop Loss / Profit Target (ticks) | 0 / 0 | Native-mode per-trade bracket. **0 = disabled**, ignored in ATM mode |
 | Aggression Window (sec) | 180 | Lookback for the reversal dominance filter |
 | Reversal Dominance Ratio | 1.5 | A reversal only fires if the new side's windowed volume is at least this many times the held side's |
 | Trade Cooldown (min) | 5 | Minimum rest after a trade closes before a new entry from flat. 0 = disabled. Does not block reversals |
+
+> ⚠️ **There is no per-trade stop unless you set one.** Both `Stop Loss (ticks)` and `Profit Target (ticks)` default to **0 = disabled**, which means that out of the box, in native mode, the only risk control is the daily USD loss limit. Set `Stop Loss (ticks)` to a non-zero value, or use ATM mode with a template that carries a stop, before running this on anything that matters.
+>
+> ATM mode is not supported by NT8 on a Playback account — the strategy logs a warning and you should prefer native mode when testing in Market Replay.
+
+## AI Advisor
+
+Manual decision support. An **Analyze** button on the chart sends the current market context to `claude-sonnet-5` — three parallel lens analysts (order flow, structure, risk) plus an orchestrator — and draws the verdict on the chart: BUY/SELL/HOLD, confidence, and Entry/SL/TP lines.
+
+**The AI never places orders.** It draws lines and text; every trade decision and every order is yours.
+
+### What is sent to Anthropic
+
+Each time you click Analyze, the following leaves your machine and is sent to the Anthropic API:
+
+- The L2 ladder (if an L2 feed is available), recent big-print clusters, recent bars (OHLCV), and session statistics for the charted instrument.
+- **A screenshot of the chart**, if `Send Chart Screenshot` is on (it is, by default). Turn it off if your chart may contain information you do not want to transmit.
+- The contents of your base prompt file — i.e. whatever account context you wrote there.
+
+Nothing is sent unless you click the button.
+
+### Local audit trail
+
+Every analysis is appended to `Documents\NinjaTrader 8\BigPrintsAI\analyses.jsonl`. The log records the market context, the lens reports, the verdict and token usage. It does **not** record your API key, and it does not record the screenshot (only a boolean saying whether one was attached).
+
+Each BUY/SHORT signal is then tracked automatically against live ticks, and its resolution (fill, stop or target, with timestamps) is appended to the same file as a `type: outcome` record — so auditing your signal quality needs no extra clicks.
+
+### Setup (one-time)
+
+1. **Add the Newtonsoft reference** — see [Install step 3](#3-add-the-json-reference--only-if-you-want-the-ai-advisor).
+2. **Put your Anthropic API key** (the key only, one line, no quotes) in `Documents\NinjaTrader 8\claude_api_key.txt`. Get one at [console.anthropic.com](https://console.anthropic.com). Change the *API Key File Path* parameter if you keep it elsewhere.
+3. **Edit `Documents\NinjaTrader 8\bigprints_base_prompt.txt`** with your account, instrument and max risk per trade. It is created with a default template on the first run and re-read on every Analyze click, so you can tune it mid-session without recompiling. It lives in a file because the NT8 property grid is single-line and rejects multiline pastes.
+
+Until step 2 is done, the panel shows `AI: API key not loaded`. The sweep detector works regardless. If you do not want the AI at all, set `Enable AI Advisor` to false.
+
+### Cost
+
+Roughly **$0.11 per click** at `claude-sonnet-5` introductory pricing, ~$0.17 after 2026-08-31. You are billed by Anthropic on your own API key; there is no cost when you are not clicking the button.
+
+Design notes: [`docs/specs/2026-07-23-ai-advisor-design.md`](docs/specs/2026-07-23-ai-advisor-design.md). Signal-quality audits: [`docs/audits/`](docs/audits/).
 
 ## NT8 crash in Playback — root cause & fix (2026-07-22)
 
 Eight hard crashes of NinjaTrader 8 (whole process dies and restarts, no error dialog) over 2026-07-21/22 while running BigPrints in accelerated Playback were all the **same bug**: WinDbg analysis of 5 crash dumps shows every one dying on `wdmaud!CWaveOutHandle::_ProcessData → ucrtbase!memcpy` (access violation on the Windows audio worker thread). That is a use-after-free of a sound buffer inside **NT8's own `PlaySound()` implementation** (NAudio `WaveOutEvent`, fire-and-forget): under Playback load, the managed side frees the buffer while the audio driver is still streaming it. Order/ATM activity in the traces was a red herring — the same big print that enters a trade also fires the chirp.
 
-**Fix shipped:** the indicator now plays sounds via a direct `winmm.dll PlaySound` P/Invoke (`SND_FILENAME | SND_ASYNC` — Windows owns the buffer, a new call safely cancels the prior one). NT8's `PlaySound()` is no longer called anywhere in this repo.
+**Fix shipped:** the indicator plays sounds via a direct `winmm.dll PlaySound` P/Invoke (`SND_FILENAME | SND_ASYNC` — Windows owns the buffer, a new call safely cancels the prior one). NT8's `PlaySound()` is no longer called anywhere in this repo.
 
-**Operator rule:** keep NT8's own event sounds (Tools → Options → Sounds — order filled, alerts, etc.) **disabled while running accelerated Playback** — they go through the same crashy NAudio path and cannot be shielded from NinjaScript.
-
-## Install
-
-Copy both `BigPrints.cs` and `BigPrintsAiClient.cs` to `Documents\NinjaTrader 8\bin\Custom\Indicators\` (the indicator references the AI client class — copying only one breaks the F5 compile), then compile in NT8 (NinjaScript Editor → F5). Add "BigPrints" to a chart.
-
-## Recommended timeframe
-
-1-minute chart for live monitoring (see repo discussion). The detection itself is timeframe-independent — it runs on the tape, not on bars — the timeframe only affects how the marks are spaced horizontally.
+**Operator rule:** keep NT8's own event sounds (Tools → Options → Sounds — order filled, alerts, etc.) **disabled while running accelerated Playback**. They go through the same crashy NAudio path and cannot be shielded from NinjaScript.
 
 ## Development
 
-Compiled outside NT8 with [nt8c](https://github.com/jalv92) (Roslyn parity with the NinjaScript Editor).
+Compiled outside NT8 with [nt8c](https://github.com/jalv92) (Roslyn parity with the NinjaScript Editor). Note that per-file checks do not catch cross-file namespace issues — build the whole staged custom directory to validate for real.
 
-## AI Advisor
+## License
 
-Manual decision support: an **Analyze** button on the chart sends the current market
-context (L2 ladder, recent big-print clusters, recent bars, session stats, chart
-screenshot) to `claude-sonnet-5` — three parallel lens analysts (order flow,
-structure, risk) plus an orchestrator — and draws the verdict on the chart:
-BUY/SELL/HOLD, confidence, Entry/SL/TP lines. Every analysis is appended to
-`Documents/NinjaTrader 8/BigPrintsAI/analyses.jsonl` (audit trail; screenshots are
-not logged). Each BUY/SHORT signal is then tracked automatically against live ticks
-and its resolution (fill, stop or target, with timestamps) is appended to the same
-file as a `type: outcome` record — audits need no extra clicks. The AI never places
-orders.
+MIT — see [LICENSE](LICENSE).
 
-**Setup (one-time):**
-1. Add the JSON assembly reference — the NinjaScript compiler does NOT reference
-   Newtonsoft by default even though NT8 ships it: NinjaScript Editor → right-click →
-   **References...** → **Add** → `C:\Program Files\NinjaTrader 8\bin\Newtonsoft.Json.dll`.
-   Without this, compilation fails with CS0246 on `Newtonsoft`.
-2. Put your Anthropic API key (the key only, one line) in
-   `Documents/NinjaTrader 8/claude_api_key.txt` (or change the *API Key File Path*
-   parameter).
-3. Edit `Documents/NinjaTrader 8/bigprints_base_prompt.txt` with your account,
-   instrument, and max risk per trade (created with a default template on first
-   run; re-read on every Analyze click, so you can tune it mid-session). The
-   *Base Prompt File Path* parameter points to it — the NT8 property grid cannot
-   hold multiline text, which is why the prompt lives in a file.
+## Disclaimer
 
-**Cost:** ~$0.11 per click at claude-sonnet-5 intro pricing (~$0.17 after 2026-08-31).
-Requires an L2 data feed for the ladder (analysis still runs without it).
-Design: `docs/specs/2026-07-23-ai-advisor-design.md`.
+This software is provided for educational and research purposes. Trading futures involves substantial risk of loss. Nothing here is financial advice, the AI Advisor's output least of all. Test in Market Replay and on a simulated account before risking real money, and read the risk warning under [Strategy parameters](#parameters--strategy-bigprintsstrategycs).
