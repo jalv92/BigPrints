@@ -1,0 +1,25 @@
+{
+  "committed": "2026-07-28",
+  "spec": "main-project docs/superpowers/specs/2026-07-28-bigprints50-meta-filter-design.md",
+  "signal": "bigprints_minvol50_continuation",
+  "frozen_rule": { "min_volume": 50, "max_gap_ms": 150, "max_span_ms": 1500, "direction": "continuation" },
+  "n_trials_prior": 128,
+  "trial_budget_total": 16,
+  "horizons_s": [60, 120, 300, 600],
+  "friction_rt_points": 1.5,
+  "kill_conditions": {
+    "KC1": "edge_to_cost < 2.0 at every declared horizon",
+    "KC2": "minimum_backtest_length(n_trials=144) exceeds the available event history",
+    "KC3": "C#-vs-Python parity failure unresolved after one debugging day (Plan 2)"
+  },
+  "gate_thresholds": {
+    "EDGE_TO_COST_MIN": 2.0,
+    "PBO_MAX": 0.25,
+    "DSR_MIN": 0.95,
+    "P10_PATH_SHARPE_MIN": 0.0,
+    "P90_PATH_MAXDD": "per-firm trailing max_dd from PropSim prop_rules.json"
+  },
+  "cold_start_K_events": 200,
+  "bracket_effect_sign": "unknown",
+  "model_authority": "reduce_only"
+}

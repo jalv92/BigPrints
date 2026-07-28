@@ -10,3 +10,7 @@ doc/
 
 # Session/process scratch (SDD ledgers, briefs, review diffs) — never commit
 .superpowers/
+
+# ml/ pre-gate: venv + generated output — never commit
+ml/.venv/
+ml/out/
