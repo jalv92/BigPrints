@@ -2,9 +2,16 @@
 
 Parametric bootstrap (no validated strategy exists yet, so trades are synthetic):
 per day, N ~ Poisson(HORIZONS) trades; each risks R = 2 x daily_budget / sqrt(HORIZONS)
-dollars; win = +1.5R (p = win_rate), loss = -R. Governor arms mirrored 1:1 from the
-C# GovernorSize() in FVGFlowStrategy.cs / BigPrintsStrategy.cs, EXCEPT the vol-shock
-arm (needs intraday bars a trade-level bootstrap does not have).
+dollars; win = +1.5R (p = win_rate), loss = -R. governor_multiplier()'s three arms
+(m_dd, m_daily, m_streak) are mirrored 1:1 from the C# GovernorSize() in
+FVGFlowStrategy.cs / BigPrintsStrategy.cs, EXCEPT the vol-shock arm (needs intraday
+bars a trade-level bootstrap does not have). The daily halt latch in run_path() also
+mirrors C#'s `_govHaltedToday` exactly: it sticks for the rest of the day ONLY when
+m_daily<=0 or m_streak<=0 — an m_dd-driven zero is transient/intraday-recoverable in
+C# (equity can climb back inside the DD cushion) and here only skips the current
+trade, same as live. daily_budget's `max_dd/5` fallback (used when a variant has no
+`daily_loss_limit`) is a deliberate MODELING CHOICE, not a C# mirror — see the
+comment at its definition below.
 ponytail: this is a DELTA comparator (gov vs raw under identical draws), not a
 PropSim replacement — both arms share the same rule approximations, so the delta
 is meaningful even where the absolute rates are approximate.
@@ -32,11 +39,14 @@ def clamp01(x):
 
 
 def governor_multiplier(equity, equity_high, dd_remaining, daily_pnl, daily_budget, consec):
+    """Returns the three arms (m_dd, m_daily, m_streak) separately — mirrored 1:1
+    from C#'s GovernorSize() (minus the vol-shock arm). Callers take min() for
+    sizing; the daily halt latch checks m_daily/m_streak only (see run_path)."""
     per_trade = 2.0 * daily_budget / math.sqrt(HORIZONS)
     m_dd = clamp01((dd_remaining - (equity_high - equity)) / (3.0 * per_trade))
     m_daily = clamp01((daily_budget + min(daily_pnl, 0.0)) / per_trade)
     m_streak = 0.0 if consec >= MAX_CONSEC else 1.0
-    return min(m_dd, m_daily, m_streak)
+    return m_dd, m_daily, m_streak
 
 
 def draw_outcomes(rng, win_rate):
@@ -48,6 +58,7 @@ def draw_outcomes(rng, win_rate):
 
 def run_path(outcomes, rule, use_governor):
     """One 30-day account path over a pre-drawn outcome stream. Returns (breached, passed)."""
+    # modeling choice, NOT the C# 500.0 fallback: scales the self-imposed budget with account size
     daily_budget = rule["daily_loss_limit"] or (rule["max_dd"] / 5.0)
     per_trade = 2.0 * daily_budget / math.sqrt(HORIZONS)
     equity = 0.0            # PnL vs start_balance
@@ -61,25 +72,30 @@ def run_path(outcomes, rule, use_governor):
             traded_days += 1
         for win in day:
             if use_governor:
-                m = governor_multiplier(equity, hwm, rule["max_dd"], daily, daily_budget, consec)
+                m_dd, m_daily, m_streak = governor_multiplier(equity, hwm, rule["max_dd"], daily, daily_budget, consec)
+                m = min(m_dd, m_daily, m_streak)
                 if halted or m < 1.0:      # 1-contract scale: m < 1 floors to 0 (skip)
-                    if m <= 0.0:
-                        halted = True       # structural zeros stick for the day
+                    if m_daily <= 0.0 or m_streak <= 0.0:
+                        halted = True       # C# latches ONLY on mDaily/mStreak zero (structural);
+                                            # an mDd-driven zero is transient/intraday-recoverable —
+                                            # skip just this trade, don't latch the day
                     continue
             pnl = WIN_R * per_trade if win else -per_trade
             equity += pnl
             daily += pnl
             consec = consec + 1 if pnl < 0 else 0
-            if rule["breach_basis"] != "eod_close" and equity <= hwm - rule["max_dd"]:
+            # breach_basis in this rule set is always "intraday_equity" or None (the "eod_close"
+            # string belongs to hwm_basis, never to breach_basis) — check intraday for all
+            # variants; None (unverified upstream, e.g. Lucid) is checked intraday too, conservative.
+            if equity <= hwm - rule["max_dd"]:
                 return True, False          # intraday trailing-DD breach
             if rule["daily_loss_limit"] and daily <= -rule["daily_loss_limit"]:
                 break                       # daily limit: day over (soft model)
-            if rule["hwm_basis"] != "eod_close":
-                hwm = max(hwm, equity)
+            if rule["hwm_basis"] not in ("eod_close", "none"):
+                hwm = max(hwm, equity)      # per-trade ratchet
         if rule["hwm_basis"] == "eod_close":
-            hwm = max(hwm, equity)
-        if rule["breach_basis"] == "eod_close" and equity <= hwm - rule["max_dd"]:
-            return True, False
+            hwm = max(hwm, equity)          # ratchet only at day close
+        # hwm_basis == "none": static floor, hwm never moves off its initial 0.0
     passed = equity >= rule["profit_target"] and traded_days >= (rule["min_days"] or 0)
     return False, passed
 
@@ -91,9 +107,20 @@ def main():
     args = ap.parse_args()
 
     rows = []
+    dd_blocked_variants = 0
     for rule in RULES:
         if not rule.get("max_dd") or not rule.get("profit_target"):
             continue  # variant not expressible in this bootstrap (e.g. funded phase w/o target)
+        # dd_arm_ceiling: the m_dd arm's value AT ZERO DRAWDOWN (its ceiling for the day).
+        # If < 1, the governor floors every 1-contract trade to skip structurally — this
+        # faithfully mirrors the real C# GovernorSize() at Contracts=1, not a sim bug
+        # (see Finding 3, Task 7 fix report: a GovHorizonsPerDay/3x-headroom calibration
+        # finding for small accounts, flagged to humans, not fixed here).
+        daily_budget = rule["daily_loss_limit"] or (rule["max_dd"] / 5.0)
+        per_trade = 2.0 * daily_budget / math.sqrt(HORIZONS)
+        dd_arm_ceiling = rule["max_dd"] / (3.0 * per_trade)
+        if dd_arm_ceiling < 1.0:
+            dd_blocked_variants += 1
         for wr in WIN_RATES:
             rng = np.random.default_rng(args.seed)
             paths = [draw_outcomes(rng, wr) for _ in range(args.paths)]  # shared by both arms
@@ -107,7 +134,7 @@ def main():
                 res["gov" if gov else "raw"] = (b / args.paths, p / args.paths)
             rows.append({
                 "firm": rule["firm"], "variant": rule["variant"], "phase": rule["phase"],
-                "size": rule["size"], "win_rate": wr,
+                "size": rule["size"], "win_rate": wr, "dd_arm_ceiling": dd_arm_ceiling,
                 "breach_raw": res["raw"][0], "breach_gov": res["gov"][0],
                 "pass_raw": res["raw"][1], "pass_gov": res["gov"][1],
             })
@@ -117,6 +144,8 @@ def main():
     df.to_csv(config.OUT / "governor_sim.csv", index=False)
     print(df.groupby("win_rate")[["breach_raw", "breach_gov", "pass_raw", "pass_gov"]].mean().round(3))
     print(f"{len(df)} rows -> out/governor_sim.csv")
+    print(f"{dd_blocked_variants}/{len(df) // len(WIN_RATES)} variants have dd_arm_ceiling < 1 "
+          "(governor blocks ALL trading at 1 contract, every win rate)")
 
 
 if __name__ == "__main__":
