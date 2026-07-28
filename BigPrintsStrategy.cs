@@ -176,8 +176,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DailyProfitTargetUSD = 500;
                 DailyLossLimitUSD    = 300;
                 AtmTemplateName      = "";    // empty = native mode
-                StopLossTicks        = 0;     // 0 = disabled
-                ProfitTargetTicks    = 0;     // 0 = disabled
+                StopLossTicks        = 60;    // 15 pts NQ; raised at entry by the 1.5x 10-bar-range vol floor (audit #2)
+                ProfitTargetTicks    = 90;    // 22.5 pts NQ = 1.5R vs the static stop
                 AggressionWindowSeconds = 180;
                 ReversalDominanceRatio  = 1.5;
                 CooldownMinutes         = 5;
@@ -682,6 +682,22 @@ namespace NinjaTrader.NinjaScript.Strategies
             return false;
         }
 
+        // Stop floor from audit #2's volatility guard: stop >= 1.5x the 10-bar average range.
+        // Static StopLossTicks is the minimum; the floor only ever WIDENS it.
+        private int VolFlooredStopTicks()
+        {
+            int stopTicks = StopLossTicks > 0 ? StopLossTicks : 60;
+            if (CurrentBar >= 10)
+            {
+                double r10 = 0;
+                for (int i = 0; i < 10; i++) r10 += High[i] - Low[i];
+                r10 /= 10.0;
+                int volFloor = (int)Math.Ceiling(1.5 * r10 / TickSize);
+                if (volFloor > stopTicks) stopTicks = volFloor;
+            }
+            return stopTicks;
+        }
+
         // NATIVE mode: EnterLong/EnterShort while in the opposite position reverses in one
         // managed-approach order (close + open), per NT8's documented Entry() reversal behavior
         // — no separate Exit() call needed. Reversal branches are gated by the aggression-balance
@@ -695,6 +711,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!PassesCooldown(isBuy, volume, now))
                     return; // consumed — not queued for later
 
+                int stopT = VolFlooredStopTicks();
+                // ponytail: hardcoded 1.5R floor keeps the reward ratio when the vol floor widens the stop
+                int tgtT  = Math.Max(ProfitTargetTicks, (int)Math.Round(stopT * 1.5));
+                SetStopLoss("BigPrintLong",  CalculationMode.Ticks, stopT, false);
+                SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
+                SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
+                SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
                 if (isBuy) EnterLong(Contracts, "BigPrintLong");
                 else       EnterShort(Contracts, "BigPrintShort");
                 _orderPending = true;
@@ -705,6 +728,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!PassesReversalFilter(true, isBuy, now))
                     return; // consumed — position rides, no reversal
 
+                int stopT = VolFlooredStopTicks();
+                // ponytail: hardcoded 1.5R floor keeps the reward ratio when the vol floor widens the stop
+                int tgtT  = Math.Max(ProfitTargetTicks, (int)Math.Round(stopT * 1.5));
+                SetStopLoss("BigPrintLong",  CalculationMode.Ticks, stopT, false);
+                SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
+                SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
+                SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
                 EnterShort(Contracts, "BigPrintShort");
                 _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: SELL x{0}", Contracts));
@@ -714,6 +744,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!PassesReversalFilter(false, isBuy, now))
                     return;
 
+                int stopT = VolFlooredStopTicks();
+                // ponytail: hardcoded 1.5R floor keeps the reward ratio when the vol floor widens the stop
+                int tgtT  = Math.Max(ProfitTargetTicks, (int)Math.Round(stopT * 1.5));
+                SetStopLoss("BigPrintLong",  CalculationMode.Ticks, stopT, false);
+                SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
+                SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
+                SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
                 EnterLong(Contracts, "BigPrintLong");
                 _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: BUY x{0}", Contracts));
