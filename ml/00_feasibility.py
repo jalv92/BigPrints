@@ -31,15 +31,22 @@ def day_moves(files, horizons_s):
         return {h: [] for h in horizons_s}, 0
     ev = clusters_from_arrays(tt, side, vol, config.MIN_VOLUME, config.GAP_MS, config.SPAN_MS)
     moves = {h: [] for h in horizons_s}
+    tmax = int(tt[-1]) if len(tt) else 0
     for t_start, t_end, s, v, n in ev:
         i_entry = int(np.searchsorted(tt, t_end, side="right"))  # first tick AFTER the cluster
         if i_entry >= len(tt):
             continue
         entry = price[i_entry]
         for h in horizons_s:
-            j = int(np.searchsorted(tt, t_end + h * TICKS_PER_S, side="right")) - 1
+            target = t_end + h * TICKS_PER_S
+            if target > tmax:
+                continue  # horizon runs past end of day's coverage — drop, never fabricate
+            j = int(np.searchsorted(tt, target, side="right")) - 1
             if j <= i_entry:
-                continue  # horizon runs past end of data — drop, never fabricate
+                continue
+            # ponytail: mid-day gaps from skipped bad files can still truncate a
+            # horizon inside [t_end, tmax]; residual is <0.1% and biases |move|
+            # DOWN (stale price closer to entry) — conservative, not fabricated.
             moves[h].append(abs(price[j] - entry))
     return moves, len(ev)
 
