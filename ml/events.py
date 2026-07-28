@@ -68,16 +68,26 @@ def clusters_from_arrays(tt, side, vol, min_volume, gap_ms, span_ms):
 
 
 def front_month_map(dirs=None, cache=True):
-    """day 'YYYYMMDD' -> contract dir with the max summed tick volume that day."""
+    """day 'YYYYMMDD' -> contract dir with the max summed tick volume that day.
+
+    Cache is keyed on the total .Last.ncd file count across dirs (cheap glob, no
+    parsing) so a growing tick download invalidates it automatically.
+    """
+    dirs = dirs or config.contract_dirs()
+    n_files = sum(len(list(d.glob("*.Last.ncd"))) for d in dirs)
     cache_path = config.OUT / "front_month_map.json"
     if cache and cache_path.exists():
-        return {d: Path(p) for d, p in json.loads(cache_path.read_text()).items()}
-    dirs = dirs or config.contract_dirs()
+        cached = json.loads(cache_path.read_text())
+        if cached.get("n_files") == n_files:
+            return {d: Path(p) for d, p in cached["map"].items()}
     day_vol = {}
     for cdir in dirs:
         for f in sorted(cdir.glob("*.Last.ncd")):
             day = f.name[:8]
-            v = sum(r[4] for r in read_ticks(f) or [])
+            try:
+                v = sum(r[4] for r in read_ticks(f))
+            except Exception:
+                continue  # 16/133 known-bad files in the db — skip, never fabricate
             key = (day, str(cdir))
             day_vol[key] = day_vol.get(key, 0) + v
     best = {}
@@ -86,7 +96,7 @@ def front_month_map(dirs=None, cache=True):
             best[day] = (cdir, v)
     result = {day: p for day, (p, _) in sorted(best.items())}
     config.OUT.mkdir(exist_ok=True)
-    cache_path.write_text(json.dumps(result, indent=1))
+    cache_path.write_text(json.dumps({"n_files": n_files, "map": result}, indent=1))
     return {d: Path(p) for d, p in result.items()}
 
 
