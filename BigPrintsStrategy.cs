@@ -105,6 +105,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   _dailyLockout;
         private int    _lastResetBar = -1;
 
+        // ── Prop governor (min-of-multipliers) — native mode only: SystemPerformance
+        // does not track ATM trades, so DD/streak arms are blind in ATM mode (the
+        // existing daily lockout still covers ATM via _atmRealizedPnLToday).
+        private int    _consecLosses;
+        private double _cumRealized;
+        private double _equityHigh;
+        private bool   _govHaltedToday;
+        private int    _lastGovTradeCount;
+
         // Set on EVERY Enter/Exit (native) or AtmStrategyCreate/Close (ATM) submission, cleared
         // once that submission's outcome is confirmed — OnExecutionUpdate in native mode,
         // PollAtmState() in ATM mode (OnExecutionUpdate does NOT fire for ATM-managed orders).
@@ -178,6 +187,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 AtmTemplateName      = "";    // empty = native mode
                 StopLossTicks        = 60;    // 15 pts NQ; raised at entry by the 1.5x 10-bar-range vol floor (audit #2)
                 ProfitTargetTicks    = 90;    // 22.5 pts NQ = 1.5R vs the static stop
+                GovTrailingDDRemaining = 0;    // 0 = governor disabled
+                GovHorizonsPerDay      = 6;
+                GovMaxConsecLosses     = 3;
+                GovVolShockMult        = 2.0;
                 AggressionWindowSeconds = 180;
                 ReversalDominanceRatio  = 1.5;
                 CooldownMinutes         = 5;
@@ -409,6 +422,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             _dayStartRealized    = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
             _atmRealizedPnLToday = 0;
             _dailyLockout        = false;
+            _consecLosses   = 0;
+            _govHaltedToday = false;
         }
 
         // True when the strategy has no effective open exposure in the active mode. Position.
@@ -423,6 +438,19 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void CheckRiskGovernor()
         {
+            int tc = SystemPerformance.AllTrades.Count;
+            if (tc > _lastGovTradeCount)
+            {
+                for (int i = _lastGovTradeCount; i < tc; i++)
+                {
+                    Trade t = SystemPerformance.AllTrades[i];
+                    _cumRealized  += t.ProfitCurrency;
+                    _consecLosses  = t.ProfitCurrency < 0 ? _consecLosses + 1 : 0;
+                }
+                _lastGovTradeCount = tc;
+                _equityHigh = Math.Max(_equityHigh, _cumRealized);
+            }
+
             if (_dailyLockout)
             {
                 // Already locked out — a single Exit/Close call isn't guaranteed to fill;
@@ -462,6 +490,49 @@ namespace NinjaTrader.NinjaScript.Strategies
             Print(string.Format("[BigPrintsStrategy] Daily {0} hit ({1:F2} USD) — locked out until next session.",
                 hitTarget ? "profit target" : "loss limit", dayPnL));
         }
+
+        // ── Prop governor (min-of-multipliers) ───────────────────────────────
+        // Four multipliers in [0,1], the SMALLEST wins. Native mode only — SystemPerformance
+        // does not track ATM trades (see field comment on the governor state block).
+        private int GovernorSize()
+        {
+            if (GovTrailingDDRemaining <= 0 || IsAtmMode) return Contracts; // disabled / ATM-blind
+
+            double unreal = Position.MarketPosition != MarketPosition.Flat
+                ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency) : 0.0;
+            double equity       = _cumRealized + unreal;
+            double dailyBudget  = DailyLossLimitUSD > 0 ? DailyLossLimitUSD : 500.0;
+            double perTradeRisk = 2.0 * dailyBudget / Math.Sqrt(GovHorizonsPerDay);
+            double dailyRealized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit - _dayStartRealized;
+
+            double mDd    = Clamp01((GovTrailingDDRemaining - (_equityHigh - equity)) / (3.0 * perTradeRisk));
+            double mDaily = Clamp01((dailyBudget + Math.Min(dailyRealized, 0.0)) / perTradeRisk);
+
+            double mVol = 1.0;
+            if (CurrentBar >= 50)
+            {
+                double r10 = 0, r50 = 0;
+                for (int i = 0; i < 50; i++)
+                {
+                    double r = High[i] - Low[i];
+                    r50 += r;
+                    if (i < 10) r10 += r;
+                }
+                r10 /= 10.0; r50 /= 50.0;
+                if (r50 > 0 && r10 > GovVolShockMult * r50)
+                    mVol = r10 > 1.5 * GovVolShockMult * r50 ? 0.0 : 0.5;
+            }
+
+            double mStreak = GovMaxConsecLosses > 0 && _consecLosses >= GovMaxConsecLosses ? 0.0 : 1.0;
+
+            if (mDaily <= 0.0 || mStreak <= 0.0) _govHaltedToday = true;
+            if (_govHaltedToday) return 0;
+
+            double m = Math.Min(Math.Min(mDd, mDaily), Math.Min(mVol, mStreak));
+            return (int)Math.Floor(Contracts * m + 1e-9);
+        }
+
+        private static double Clamp01(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
 
         private void CheckSessionEnd()
         {
@@ -706,6 +777,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             MarketPosition pos = Position.MarketPosition;
 
+            int gov = GovernorSize();
+            if (gov < 1)
+            {
+                // Blocked while holding a position: a reversal signal becomes a flatten,
+                // never a flip — the governor may only REDUCE exposure.
+                if (pos != MarketPosition.Flat && !_orderPending)
+                    FlattenNow("BigPrintGovernor");
+                return;
+            }
+
             if (pos == MarketPosition.Flat)
             {
                 if (!PassesCooldown(isBuy, volume, now))
@@ -718,8 +799,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
                 SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
                 SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
-                if (isBuy) EnterLong(Contracts, "BigPrintLong");
-                else       EnterShort(Contracts, "BigPrintShort");
+                if (isBuy) EnterLong(gov, "BigPrintLong");
+                else       EnterShort(gov, "BigPrintShort");
                 _orderPending = true;
                 Print(string.Format("[BigPrints] Native entry submitted: {0} x{1}", isBuy ? "BUY" : "SELL", Contracts));
             }
@@ -735,7 +816,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
                 SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
                 SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
-                EnterShort(Contracts, "BigPrintShort");
+                EnterShort(gov, "BigPrintShort");
                 _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: SELL x{0}", Contracts));
             }
@@ -751,7 +832,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
                 SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
                 SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
-                EnterLong(Contracts, "BigPrintLong");
+                EnterLong(gov, "BigPrintLong");
                 _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: BUY x{0}", Contracts));
             }
@@ -942,6 +1023,26 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(0, 2000)]
         [Display(Name = "Profit Target (ticks)", Description = "NATIVE mode only, ignored in ATM mode. Profit target in ticks. Effective target is never below 1.5x the effective stop.", Order = 10, GroupName = "Parameters")]
         public int ProfitTargetTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 1000000)]
+        [Display(Name = "Trailing DD Remaining ($)", Description = "Trailing-drawdown headroom at strategy enable, from the prop dashboard. 0 = governor disabled.", Order = 1, GroupName = "Prop Governor")]
+        public double GovTrailingDDRemaining { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name = "Horizons Per Day", Description = "Expected trades/day for the per-trade risk split: risk = 2 x daily budget / sqrt(horizons).", Order = 2, GroupName = "Prop Governor")]
+        public int GovHorizonsPerDay { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 20)]
+        [Display(Name = "Max Consecutive Losses", Description = "Session halt after this many consecutive losing trades. 0 = disabled.", Order = 3, GroupName = "Prop Governor")]
+        public int GovMaxConsecLosses { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1.0, 10.0)]
+        [Display(Name = "Vol Shock Mult", Description = "Half size when 10-bar avg range > mult x 50-bar avg range; zero size beyond 1.5x that.", Order = 4, GroupName = "Prop Governor")]
+        public double GovVolShockMult { get; set; }
 
         [NinjaScriptProperty]
         [Range(10, 3600)]
