@@ -935,12 +935,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(0, 2000)]
-        [Display(Name = "Stop Loss (ticks)", Description = "NATIVE mode only, ignored in ATM mode. 0 = disabled.", Order = 9, GroupName = "Parameters")]
+        [Display(Name = "Stop Loss (ticks)", Description = "NATIVE mode only, ignored in ATM mode. Static stop in ticks. Values <= 0 fall back to 60. The 1.5x 10-bar-range vol floor can only WIDEN it.", Order = 9, GroupName = "Parameters")]
         public int StopLossTicks { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 2000)]
-        [Display(Name = "Profit Target (ticks)", Description = "NATIVE mode only, ignored in ATM mode. 0 = disabled.", Order = 10, GroupName = "Parameters")]
+        [Display(Name = "Profit Target (ticks)", Description = "NATIVE mode only, ignored in ATM mode. Profit target in ticks. Effective target is never below 1.5x the effective stop.", Order = 10, GroupName = "Parameters")]
         public int ProfitTargetTicks { get; set; }
 
         [NinjaScriptProperty]
