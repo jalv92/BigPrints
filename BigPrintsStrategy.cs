@@ -525,7 +525,11 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             double mStreak = GovMaxConsecLosses > 0 && _consecLosses >= GovMaxConsecLosses ? 0.0 : 1.0;
 
-            if (mDaily <= 0.0 || mStreak <= 0.0) _govHaltedToday = true;
+            if ((mDaily <= 0.0 || mStreak <= 0.0) && !_govHaltedToday)
+            {
+                _govHaltedToday = true;
+                Print(string.Format("[BigPrints] governor HALT for session (mDaily={0:0.00} mStreak={1:0.00} consecLosses={2})", mDaily, mStreak, _consecLosses));
+            }
             if (_govHaltedToday) return 0;
 
             double m = Math.Min(Math.Min(mDd, mDaily), Math.Min(mVol, mStreak));
@@ -784,6 +788,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // never a flip — the governor may only REDUCE exposure.
                 if (pos != MarketPosition.Flat && !_orderPending)
                     FlattenNow("BigPrintGovernor");
+                else if (pos == MarketPosition.Flat)
+                    Print(string.Format("[BigPrints] governor SKIP signal at {0}", Time[0]));
                 return;
             }
 
@@ -802,7 +808,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (isBuy) EnterLong(gov, "BigPrintLong");
                 else       EnterShort(gov, "BigPrintShort");
                 _orderPending = true;
-                Print(string.Format("[BigPrints] Native entry submitted: {0} x{1}", isBuy ? "BUY" : "SELL", Contracts));
+                Print(string.Format("[BigPrints] Native entry submitted: {0} x{1}", isBuy ? "BUY" : "SELL", gov));
             }
             else if (pos == MarketPosition.Long && !isBuy)
             {
@@ -818,7 +824,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
                 EnterShort(gov, "BigPrintShort");
                 _orderPending = true;
-                Print(string.Format("[BigPrints] Native reversal submitted: SELL x{0}", Contracts));
+                Print(string.Format("[BigPrints] Native reversal submitted: SELL x{0}", gov));
             }
             else if (pos == MarketPosition.Short && isBuy)
             {
@@ -834,7 +840,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
                 EnterLong(gov, "BigPrintLong");
                 _orderPending = true;
-                Print(string.Format("[BigPrints] Native reversal submitted: BUY x{0}", Contracts));
+                Print(string.Format("[BigPrints] Native reversal submitted: BUY x{0}", gov));
             }
             // else: same-direction cluster while already positioned — stay in, do nothing.
         }
