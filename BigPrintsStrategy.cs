@@ -1032,7 +1032,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Range(0, 1000000)]
-        [Display(Name = "Trailing DD Remaining ($)", Description = "Trailing-drawdown headroom at strategy enable, from the prop dashboard. 0 = governor disabled.", Order = 1, GroupName = "Prop Governor")]
+        [Display(Name = "Trailing DD Remaining ($)", Description = "Trailing-drawdown headroom at strategy enable, from the prop dashboard. 0 = governor disabled. Native mode only — no effect when ATM Template Name is set.", Order = 1, GroupName = "Prop Governor")]
         public double GovTrailingDDRemaining { get; set; }
 
         [NinjaScriptProperty]

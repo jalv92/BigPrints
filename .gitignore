@@ -14,3 +14,4 @@ doc/
 # ml/ pre-gate: venv + generated output — never commit
 ml/.venv/
 ml/out/
+__pycache__/
