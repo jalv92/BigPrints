@@ -156,6 +156,11 @@ Parameters are grouped in the NT8 property grid (numeric prefixes keep the order
 |---|---|---|
 | Contracts | 1 | Quantity per entry/reversal. Native mode only — ATM mode sizes from the template |
 | Daily Profit Target / Loss Limit (USD) | 500 / 300 | Flatten + lock out entries for the rest of the day once hit (includes open PnL). 0 = disabled. Net of commission |
+| Shared Daily PnL (account-wide) | true | ON: the daily target/loss watches the ACCOUNT's combined realized+unrealized PnL — the sum across every market/instance of this strategy (multi-market mode; any other trading on the account counts too, prop-firm semantics). Each instance flattens its own position and locks out on breach. OFF: each instance watches only its own PnL |
+
+### Running multiple markets (MNQ + ES + ...)
+
+Enable one instance of the strategy per chart, all on the same account, with the SAME Daily Profit Target / Loss Limit on each and `Shared Daily PnL` ON (the default). The account's PnL **is** the sum across markets, so no inter-instance communication is needed: every instance watches the same combined number and, when it crosses the target or the loss limit, each one flattens its own position and locks out for the session — they all stop within a tick of each other. High/low watermarks make the breach sticky, so an instance can't miss it because another instance flattened first.
 
 **04. Session**
 

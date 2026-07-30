@@ -106,6 +106,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   _dailyLockout;
         private int    _lastResetBar = -1;
 
+        // Shared (account-wide) daily PnL mode: all chart instances of this strategy run on the
+        // SAME account, so the account's realized+unrealized PnL IS the sum across markets — no
+        // inter-instance channel needed. Each instance watches the same number and, on breach,
+        // flattens ITS OWN position and locks out; N instances all stop within a tick. High/low
+        // watermarks make the breach sticky, so instance B still locks even if instance A's
+        // flatten pulled the combined PnL back under the target before B's next tick.
+        private double _dayStartAcctRealized = double.NaN; // NaN = no baseline yet -> per-strategy fallback
+        private double _acctPnlHigh;
+        private double _acctPnlLow;
+
         // ── Prop governor (min-of-multipliers) — native mode only: SystemPerformance
         // does not track ATM trades, so DD/streak arms are blind in ATM mode (the
         // existing daily lockout still covers ATM via _atmRealizedPnLToday).
@@ -195,6 +205,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double _tradeFloor;       // hard floor: initial stop price, raised to BE once armed
         private bool   _beArmed;
         private double _lastStopSent;     // CURRENT working stop price: floor at init, updated on each send, resynced by OnOrderUpdate on a failed change
+        private double _lastRejectedStop; // last CHANGE price the engine rejected; don't re-attempt within 2 ticks of it (kills the per-tick retry spam seen 2026-07-29)
         private bool   _stopOrderFailed;  // stop-loss PLACEMENT rejected -> naked position; OnBarUpdate flattens and retries until flat
 
         protected override void OnStateChange()
@@ -220,6 +231,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DailyProfitTargetUSD = 500;
                 DailyLossLimitUSD    = 300;
                 AtmTemplateName      = "";    // empty = native mode
+                UseAccountDailyPnL   = true;  // daily target/loss on the ACCOUNT's combined PnL (all instances/markets)
                 AtrPeriod            = 14;
                 AtrStopMult          = 2.0;   // stop = 2 x ATR, no tick cap (accepted risk — see LIVE-MONEY GATE)
                 RewardMultiple       = 1.5;   // target = stop x this
@@ -507,6 +519,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             _dailyLockout        = false;
             _consecLosses   = 0;
             _govHaltedToday = false;
+
+            // Account-wide baseline for the shared daily governor. During historical processing
+            // the account value is constant, so the last session-start reset before realtime
+            // leaves baseline = account realized at enable — PnL from before the enable does not
+            // count, matching the per-strategy restart semantics in the LIVE-MONEY GATE note.
+            if (Account != null)
+                _dayStartAcctRealized = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
+            _acctPnlHigh = 0;
+            _acctPnlLow  = 0;
         }
 
         // True when the strategy has no effective open exposure in the active mode. Position.
@@ -545,33 +566,50 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (DailyProfitTargetUSD <= 0 && DailyLossLimitUSD <= 0)
                 return; // both disabled — nothing to compute
 
-            double realized, unrealized;
-            if (IsAtmMode)
+            bool hitTarget, hitLoss;
+            double dayPnL;
+            bool sharedMode = UseAccountDailyPnL && Account != null && !double.IsNaN(_dayStartAcctRealized);
+            if (sharedMode)
             {
-                realized   = _atmRealizedPnLToday;
-                unrealized = (_atmPositionOpen && !string.IsNullOrEmpty(_atmStrategyId))
-                    ? SafeGetAtmUnrealized(_atmStrategyId)
-                    : 0.0;
+                // Account-wide: the sum across every market/instance on this account (see the
+                // field comment on _dayStartAcctRealized). Watermarks make the breach sticky.
+                double realized   = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar) - _dayStartAcctRealized;
+                double unrealized = Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
+                dayPnL = realized + unrealized;
+                _acctPnlHigh = Math.Max(_acctPnlHigh, dayPnL);
+                _acctPnlLow  = Math.Min(_acctPnlLow, dayPnL);
+                hitTarget = DailyProfitTargetUSD > 0 && _acctPnlHigh >= DailyProfitTargetUSD;
+                hitLoss   = DailyLossLimitUSD > 0 && _acctPnlLow <= -DailyLossLimitUSD;
             }
             else
             {
-                realized   = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit - _dayStartRealized;
-                unrealized = Position.MarketPosition != MarketPosition.Flat
-                    ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
-                    : 0.0;
+                double realized, unrealized;
+                if (IsAtmMode)
+                {
+                    realized   = _atmRealizedPnLToday;
+                    unrealized = (_atmPositionOpen && !string.IsNullOrEmpty(_atmStrategyId))
+                        ? SafeGetAtmUnrealized(_atmStrategyId)
+                        : 0.0;
+                }
+                else
+                {
+                    realized   = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit - _dayStartRealized;
+                    unrealized = Position.MarketPosition != MarketPosition.Flat
+                        ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
+                        : 0.0;
+                }
+                dayPnL    = realized + unrealized;
+                hitTarget = DailyProfitTargetUSD > 0 && dayPnL >= DailyProfitTargetUSD;
+                hitLoss   = DailyLossLimitUSD > 0 && dayPnL <= -DailyLossLimitUSD;
             }
-            double dayPnL = realized + unrealized;
-
-            bool hitTarget = DailyProfitTargetUSD > 0 && dayPnL >= DailyProfitTargetUSD;
-            bool hitLoss   = DailyLossLimitUSD > 0 && dayPnL <= -DailyLossLimitUSD;
 
             if (!hitTarget && !hitLoss)
                 return;
 
             _dailyLockout = true;
             FlattenNow("BigPrintRiskGovernor");
-            Print(string.Format("[BigPrintsStrategy] Daily {0} hit ({1:F2} USD) — locked out until next session.",
-                hitTarget ? "profit target" : "loss limit", dayPnL));
+            Print(string.Format("[BigPrintsStrategy] Daily {0} hit ({1:F2} USD{2}) — locked out until next session.",
+                hitTarget ? "profit target" : "loss limit", dayPnL, sharedMode ? ", account-wide" : ""));
         }
 
         // ── Prop governor (min-of-multipliers) ───────────────────────────────
@@ -879,8 +917,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             _tradeIsLong     = false;
             _tradeMaxFav     = 0;
             _tradeFloor      = 0;
-            _beArmed         = false;
-            _lastStopSent    = 0;
+            _beArmed          = false;
+            _lastStopSent     = 0;
+            _lastRejectedStop = 0;
         }
 
         // Arms the initial ATR brackets for the entry/reversal about to be submitted: stop =
@@ -1027,6 +1066,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (Math.Abs(desired - _lastStopSent) < TickSize / 2)
                 return; // unchanged — don't spam order modifications
+
+            // Rejection damper: the engine just refused a change near this level — re-attempting
+            // the same price every tick only produces an error-spam loop ("Stop change failed ...
+            // stop still working" dozens of times, seen 2026-07-29). Retry only once the trail
+            // wants a level at least 2 ticks away from the rejected one.
+            if (_lastRejectedStop != 0 && Math.Abs(desired - _lastRejectedStop) < 2 * TickSize)
+                return;
+
             _lastStopSent = desired;
 
             SetStopLoss(isLong ? "BigPrintLong" : "BigPrintShort", CalculationMode.Price, desired, false);
@@ -1247,7 +1294,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                         ? order.OrderAction == OrderAction.Sell
                         : Position.MarketPosition == MarketPosition.Short && order.OrderAction == OrderAction.BuyToCover;
                     if (matchesSide && stopPrice > 0)
-                        _lastStopSent = stopPrice;
+                    {
+                        _lastRejectedStop = _lastStopSent; // the price we attempted — damper blocks re-attempts near it
+                        _lastStopSent     = stopPrice;     // resync to the order's real working price
+                    }
                     Print(string.Format("[BigPrints] Stop change failed ({0}) — stop still working @ {1}.", error, stopPrice));
                 }
                 return;
@@ -1350,6 +1400,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [Range(0, double.MaxValue)]
         [Display(Name = "Daily Loss Limit (USD)", Description = "Flatten and lock out entries for the rest of the day once hit (includes open PnL). 0 = disabled.", Order = 3, GroupName = "03. Money Management")]
         public double DailyLossLimitUSD { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Shared Daily PnL (account-wide)", Description = "ON: the daily target/loss watches the ACCOUNT's combined realized+unrealized PnL — the sum across every market/instance of this strategy on the account (any other trading on the account counts too, prop-firm semantics). Each instance flattens its own position and locks out on breach. OFF: each instance watches only its own PnL. Set the same target/loss on every instance.", Order = 4, GroupName = "03. Money Management")]
+        public bool UseAccountDailyPnL { get; set; }
 
         // ── 04. Session ─────────────────────────────────────────────────────
         [NinjaScriptProperty]
