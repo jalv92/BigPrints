@@ -252,6 +252,23 @@ rewinds/jumps discard the buffer automatically.
 Validate a capture: `python3 tools/validate_recording.py <recording.json>`.
 Design: workspace `docs/superpowers/specs/2026-07-30-bigprints-event-recorder-design.md`.
 
+## Discriminator Entry Mode (strategy v2)
+
+Set **Entry Mode = Discriminator** on BigPrintsStrategy to replace the instant
+with-the-sweep entry: the strategy waits 5 s after each cluster ≥ Min Volume, evaluates
+three pre-registered discriminators (T1 sweep anatomy percentile+throughput, T2
+extension per-level volume-collapse ratio, T3 post-sweep delta flip — thresholds frozen
+from `docs/audits/2026-07-30-recorder-pair-analysis.md` §4, deliberately not
+parameters), and with ≥2 agreeing votes (none opposing) fades reversal-prone sweeps or
+follows continuation-prone ones. Buy sweeps are mirrored (unstudied symmetry).
+
+Every cluster is logged with its discriminator values and eventual outcome label to
+`Documents/NinjaTrader 8/BigPrintsAI/discriminator_log.jsonl` in BOTH entry modes —
+this file is the validation corpus. Check it with
+`python3 tools/validate_discriminator_log.py <log>`. The pre-registered decision rule:
+a discriminator is validated only at ≥22/30 correct on ≥30 admissible events (see the
+audit §4/§5 for admissibility and what n=2 cannot claim).
+
 ## Disclaimer
 
 This software is provided for educational and research purposes. Trading futures involves substantial risk of loss. Nothing here is financial advice, the AI Advisor's output least of all. Test in Market Replay and on a simulated account before risking real money, and read the risk warning under [Strategy parameters](#parameters--strategy-bigprintsstrategycs).
