@@ -931,11 +931,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return; // static ATR stop from entry stands untouched
             }
 
-            // A sell stop must rest below the market (and vice versa). If price has already
-            // overrun the desired level, do NOT chase it past the floor — leave the working
-            // stop alone; it is at/inside that level and about to trigger anyway.
+            // A sell stop must rest below the BID, a buy stop above the ASK — validate against
+            // the live inside market, not Close[0] (the last trade can sit on the wrong side of
+            // the spread, e.g. a short's buy stop vs a last at the bid). Plus a safety buffer:
+            // the market keeps moving between this check and the modification landing, and a
+            // rejected stop-modify makes NT8's default error handling terminate the WHOLE
+            // strategy (seen in Playback 2026-07-29: "Stop price can't be changed below the
+            // market"). If the desired level is too close, leave the working stop alone this
+            // tick — it is about to trigger anyway, or next tick retries.
+            double bid = _bid, ask = _ask; // written by the tape thread; benign torn-free double reads
+            if (bid <= 0 || ask <= 0)
+                return;
             desired = Instrument.MasterInstrument.RoundToTickSize(desired);
-            if (isLong ? desired > Close[0] - TickSize : desired < Close[0] + TickSize)
+            // ponytail: fixed 4-tick buffer — enough for accelerated Playback jumps; make it a
+            // parameter only if a live fast market ever rejects a modify through it.
+            const int StopMarketBufferTicks = 4;
+            double closest = isLong ? bid - StopMarketBufferTicks * TickSize
+                                    : ask + StopMarketBufferTicks * TickSize;
+            if (isLong ? desired > closest : desired < closest)
                 return;
 
             if (_lastStopSent != 0 && Math.Abs(desired - _lastStopSent) < TickSize / 2)
