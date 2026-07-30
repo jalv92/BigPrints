@@ -107,14 +107,29 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int    _lastResetBar = -1;
 
         // Shared (account-wide) daily PnL mode: all chart instances of this strategy run on the
-        // SAME account, so the account's realized+unrealized PnL IS the sum across markets — no
-        // inter-instance channel needed. Each instance watches the same number and, on breach,
-        // flattens ITS OWN position and locks out; N instances all stop within a tick. High/low
-        // watermarks make the breach sticky, so instance B still locks even if instance A's
-        // flatten pulled the combined PnL back under the target before B's next tick.
-        private double _dayStartAcctRealized = double.NaN; // NaN = no baseline yet -> per-strategy fallback
-        private double _acctPnlHigh;
-        private double _acctPnlLow;
+        // SAME account, so the account's realized+unrealized PnL IS the sum across markets.
+        // STATIC registry = shared across every instance in the NT8 process (all NinjaScript
+        // lives in one AppDomain): one entry per account holding the trading day, the day's
+        // baseline (first instance to see the day writes it, later ones ADOPT it — identical
+        // budgets even across mid-session enables), and the breach broadcast. The broadcast is
+        // what makes a breach reach every instance: a per-instance watermark can miss a peak
+        // that happened between its own instrument's ticks (audit 2026-07-29), but each
+        // instance re-reads the shared entry under lock on every one of its ticks — NEVER a
+        // cached reference, so a wipe-and-recreate (another instance enabling) can't split the
+        // group. DataLoaded wipes this account's entry so a Playback rewind (which resets the
+        // account) starts clean; live consequence, documented: restarting ONE instance
+        // mid-session re-baselines the shared day budget (matches the existing per-strategy
+        // restart semantics), and already-locked instances stay locked via their local
+        // _dailyLockout.
+        private sealed class AcctDayGov
+        {
+            public DateTime Day;
+            public double   Baseline;
+            public volatile bool Breached;
+        }
+        private static readonly object _acctGovLock = new object();
+        private static readonly Dictionary<string, AcctDayGov> _acctGov = new Dictionary<string, AcctDayGov>();
+        private DateTime _acctSessionDay; // this instance's current trading day; MinValue = not established -> per-strategy fallback
 
         // ── Prop governor (min-of-multipliers) — native mode only: SystemPerformance
         // does not track ATM trades, so DD/streak arms are blind in ATM mode (the
@@ -205,7 +220,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double _tradeFloor;       // hard floor: initial stop price, raised to BE once armed
         private bool   _beArmed;
         private double _lastStopSent;     // CURRENT working stop price: floor at init, updated on each send, resynced by OnOrderUpdate on a failed change
-        private double _lastRejectedStop; // last CHANGE price the engine rejected; don't re-attempt within 2 ticks of it (kills the per-tick retry spam seen 2026-07-29)
+        private DateTime _nextStopModifyUtc; // TIME backoff after a rejected CHANGE (a price-band veto froze a fixed breakeven park forever — audit 2026-07-29); wall clock, it measures system latency
         private bool   _stopOrderFailed;  // stop-loss PLACEMENT rejected -> naked position; OnBarUpdate flattens and retries until flat
 
         protected override void OnStateChange()
@@ -295,6 +310,16 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _stopOrderFailed  = false;
                 ResetTradeState();
 
+                // Shared-governor: wipe this account's registry entry so a Playback rewind
+                // (which resets the account) starts clean; instances re-register on their next
+                // tick via CurrentAccountDay(), so simultaneous enables reconverge on one
+                // entry. Live consequence (documented): restarting ONE instance mid-session
+                // re-baselines the shared day budget for the account, matching the existing
+                // per-strategy restart semantics.
+                _acctSessionDay = DateTime.MinValue;
+                if (Account != null)
+                    lock (_acctGovLock) _acctGov.Remove(Account.Name);
+
                 _atmStrategyId       = string.Empty;
                 _atmOrderId          = string.Empty;
                 _atmPending          = false;
@@ -352,6 +377,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Print("[BigPrints] WARNING: order pending 60s+ (wall clock) with no order events — submission presumed ignored; resetting the gate.");
                 _orderPending = false;
+            }
+
+            // Mid-session enable can miss DailyReset entirely (no session-open bar in the
+            // loaded data), which would silently leave shared mode inoperative (audit
+            // 2026-07-29) — establish the day at the first realtime tick instead, visibly.
+            if (UseAccountDailyPnL && _acctSessionDay == DateTime.MinValue &&
+                State == State.Realtime && Account != null)
+            {
+                _acctSessionDay = Time[0].Date;
+                CurrentAccountDay();
+                Print("[BigPrints] Shared daily PnL day/baseline established at enable (no session-open bar in loaded data).");
             }
 
             PollAtmState();
@@ -520,14 +556,43 @@ namespace NinjaTrader.NinjaScript.Strategies
             _consecLosses   = 0;
             _govHaltedToday = false;
 
-            // Account-wide baseline for the shared daily governor. During historical processing
-            // the account value is constant, so the last session-start reset before realtime
-            // leaves baseline = account realized at enable — PnL from before the enable does not
-            // count, matching the per-strategy restart semantics in the LIVE-MONEY GATE note.
-            if (Account != null)
-                _dayStartAcctRealized = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar);
-            _acctPnlHigh = 0;
-            _acctPnlLow  = 0;
+            // Account-wide baseline day for the shared daily governor: the registry entry for
+            // this account+day is fetched-or-created per tick in CurrentAccountDay(), so all
+            // instances compute against the IDENTICAL baseline (a per-instance snapshot could
+            // diverge if a fill landed between two instances' session-open bars — audit
+            // 2026-07-29). A new day replaces the entry, which also makes any day-boundary
+            // self-reset of the account item harmless (fresh baseline every session).
+            _acctSessionDay = Time[0].Date;
+            CurrentAccountDay();
+        }
+
+        // Fetch-or-create the shared registry entry for this account + this instance's trading
+        // day — called EVERY governor tick, never cached (see the field comment on _acctGov).
+        // Returns null when shared mode can't operate yet: no day established, no account, or
+        // another instance is already on a NEWER day (this instance's session clock is behind —
+        // never overwrite a newer entry with an older-keyed one).
+        private AcctDayGov CurrentAccountDay()
+        {
+            if (Account == null || _acctSessionDay == DateTime.MinValue)
+                return null;
+            lock (_acctGovLock)
+            {
+                AcctDayGov g;
+                _acctGov.TryGetValue(Account.Name, out g);
+                if (g != null && g.Day > _acctSessionDay)
+                    return null;
+                if (g == null || g.Day < _acctSessionDay)
+                {
+                    g = new AcctDayGov
+                    {
+                        Day      = _acctSessionDay,
+                        Baseline = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar),
+                        Breached = false,
+                    };
+                    _acctGov[Account.Name] = g;
+                }
+                return g;
+            }
         }
 
         // True when the strategy has no effective open exposure in the active mode. Position.
@@ -568,18 +633,28 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             bool hitTarget, hitLoss;
             double dayPnL;
-            bool sharedMode = UseAccountDailyPnL && Account != null && !double.IsNaN(_dayStartAcctRealized);
+            AcctDayGov gov = UseAccountDailyPnL ? CurrentAccountDay() : null;
+            bool sharedMode = gov != null;
             if (sharedMode)
             {
-                // Account-wide: the sum across every market/instance on this account (see the
-                // field comment on _dayStartAcctRealized). Watermarks make the breach sticky.
-                double realized   = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar) - _dayStartAcctRealized;
+                // Account-wide: the sum across every market/instance on this account. The
+                // registry's Breached flag is the broadcast — another instance may have seen a
+                // peak between THIS instrument's ticks (per-instance sampling misses it, audit
+                // 2026-07-29), so honor the flag before sampling.
+                if (gov.Breached)
+                {
+                    _dailyLockout = true;
+                    FlattenNow("BigPrintRiskGovernor");
+                    Print("[BigPrintsStrategy] Account-wide daily limit breach broadcast received — locked out until next session.");
+                    return;
+                }
+                double realized   = Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar) - gov.Baseline;
                 double unrealized = Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
                 dayPnL = realized + unrealized;
-                _acctPnlHigh = Math.Max(_acctPnlHigh, dayPnL);
-                _acctPnlLow  = Math.Min(_acctPnlLow, dayPnL);
-                hitTarget = DailyProfitTargetUSD > 0 && _acctPnlHigh >= DailyProfitTargetUSD;
-                hitLoss   = DailyLossLimitUSD > 0 && _acctPnlLow <= -DailyLossLimitUSD;
+                hitTarget = DailyProfitTargetUSD > 0 && dayPnL >= DailyProfitTargetUSD;
+                hitLoss   = DailyLossLimitUSD > 0 && dayPnL <= -DailyLossLimitUSD;
+                if (hitTarget || hitLoss)
+                    gov.Breached = true; // broadcast to every other instance on this account
             }
             else
             {
@@ -917,9 +992,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             _tradeIsLong     = false;
             _tradeMaxFav     = 0;
             _tradeFloor      = 0;
-            _beArmed          = false;
-            _lastStopSent     = 0;
-            _lastRejectedStop = 0;
+            _beArmed           = false;
+            _lastStopSent      = 0;
+            _nextStopModifyUtc = DateTime.MinValue;
         }
 
         // Arms the initial ATR brackets for the entry/reversal about to be submitted: stop =
@@ -1067,11 +1142,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (Math.Abs(desired - _lastStopSent) < TickSize / 2)
                 return; // unchanged — don't spam order modifications
 
-            // Rejection damper: the engine just refused a change near this level — re-attempting
-            // the same price every tick only produces an error-spam loop ("Stop change failed ...
-            // stop still working" dozens of times, seen 2026-07-29). Retry only once the trail
-            // wants a level at least 2 ticks away from the rejected one.
-            if (_lastRejectedStop != 0 && Math.Abs(desired - _lastRejectedStop) < 2 * TickSize)
+            // Rejection damper: after a refused change, hold off further modifies briefly —
+            // re-attempting every tick only produces an error-spam loop ("Stop change failed
+            // ... stop still working" dozens of times, seen 2026-07-29). A TIME backoff, not a
+            // price band: a band permanently froze a fixed breakeven park after one transient
+            // rejection (audit 2026-07-29); time always self-heals.
+            if (DateTime.UtcNow < _nextStopModifyUtc)
                 return;
 
             _lastStopSent = desired;
@@ -1290,14 +1366,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // previous trade can land after a reversal re-seeded the tracker — its
                     // OrderAction won't match the current position's protective side, and
                     // accepting it would freeze the trail behind the hands-off check.
+                    // Back off further modifies for 2s wall regardless of which trade the
+                    // rejection belonged to — worst case a new trade's first trail update is
+                    // delayed 2s; the resync below stays side-gated.
+                    _nextStopModifyUtc = DateTime.UtcNow.AddSeconds(2);
                     bool matchesSide = Position.MarketPosition == MarketPosition.Long
                         ? order.OrderAction == OrderAction.Sell
                         : Position.MarketPosition == MarketPosition.Short && order.OrderAction == OrderAction.BuyToCover;
                     if (matchesSide && stopPrice > 0)
-                    {
-                        _lastRejectedStop = _lastStopSent; // the price we attempted — damper blocks re-attempts near it
-                        _lastStopSent     = stopPrice;     // resync to the order's real working price
-                    }
+                        _lastStopSent = stopPrice; // resync to the order's real working price
                     Print(string.Format("[BigPrints] Stop change failed ({0}) — stop still working @ {1}.", error, stopPrice));
                 }
                 return;

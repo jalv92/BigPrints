@@ -160,7 +160,9 @@ Parameters are grouped in the NT8 property grid (numeric prefixes keep the order
 
 ### Running multiple markets (MNQ + ES + ...)
 
-Enable one instance of the strategy per chart, all on the same account, with the SAME Daily Profit Target / Loss Limit on each and `Shared Daily PnL` ON (the default). The account's PnL **is** the sum across markets, so no inter-instance communication is needed: every instance watches the same combined number and, when it crosses the target or the loss limit, each one flattens its own position and locks out for the session — they all stop within a tick of each other. High/low watermarks make the breach sticky, so an instance can't miss it because another instance flattened first.
+Enable one instance of the strategy per chart, all on the same account, with the SAME Daily Profit Target / Loss Limit on each and `Shared Daily PnL` ON (the default). The account's PnL **is** the sum across markets: every instance watches the same combined number (identical baseline, adopted from a process-wide per-account registry) and, when it crosses the target or the loss limit, the detecting instance raises a **breach broadcast** that every other instance honors on its next tick — so nobody can miss the breach just because another instance flattened first or because the peak happened between its own instrument's ticks. Each instance flattens its own position and locks out for the session.
+
+Restart semantics (documented, same spirit as single-instance): re-enabling any instance re-baselines the shared day budget for the account (required so a Playback rewind — which resets the account — starts clean); an already-locked instance stays locked.
 
 **04. Session**
 
