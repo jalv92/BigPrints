@@ -115,13 +115,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool   _govHaltedToday;
         private int    _lastGovTradeCount;
 
-        // Set on EVERY Enter/Exit (native) or AtmStrategyCreate/Close (ATM) submission, cleared
-        // once that submission's outcome is confirmed — OnExecutionUpdate in native mode,
-        // PollAtmState() in ATM mode (OnExecutionUpdate does NOT fire for ATM-managed orders).
-        // Position.MarketPosition is stale until the fill confirms, and NT8's duplicate-order
-        // safety net does not cover market orders — without this gate a rapid opposite cluster
-        // (or the risk governor's per-tick retry) would double-submit.
-        private bool _orderPending;
+        // Set BEFORE every Enter/Exit (native) or AtmStrategyCreate/Close (ATM) submission via
+        // MarkOrderPending(), cleared once that submission's outcome is confirmed —
+        // OnExecutionUpdate in native mode, PollAtmState() in ATM mode (OnExecutionUpdate does
+        // NOT fire for ATM-managed orders). Position.MarketPosition is stale until the fill
+        // confirms, and NT8's duplicate-order safety net does not cover market orders — without
+        // this gate a rapid opposite cluster (or the risk governor's per-tick retry) would
+        // double-submit. ORDERING IS LOAD-BEARING: order events arrive on another thread and can
+        // process BEFORE the statement after Enter*() runs (documented NT8 race — see the
+        // SampleOnOrderUpdate note about assignments not being complete). Setting the flag AFTER
+        // the call overwrote the fill's clear and kept it stuck for the entire trade, which
+        // blocked reversals AND the daily-target flatten until found on 2026-07-29.
+        private volatile bool _orderPending;
+        private string   _pendingSignal;        // Name of the tracked in-flight order — gate clears ONLY on ITS terminal event, never on a racing bracket's fill (audit 2026-07-29)
+        private DateTime _orderPendingSinceUtc; // WALL clock, not tape time: the watchdog measures order-event latency (a system property), and under accelerated Playback tape time runs many times faster than the events it would be waiting on
 
         // --- ATM state (Hybrid mode — pattern mirrored from TBStrategy.cs) ---
         private string _atmStrategyId  = string.Empty;
@@ -133,6 +140,17 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double _atmRealizedPnLToday; // SystemPerformance does not track ATM trades — summed by hand
 
         private bool IsAtmMode => !string.IsNullOrEmpty(AtmTemplateName);
+
+        // ALWAYS call this BEFORE the Enter*/Exit*/AtmStrategy* submission it guards — never
+        // after (see the ordering note on _orderPending). signal = the Name the submitted order
+        // will carry; only that order's terminal event may clear the gate. ATM submissions pass
+        // "ATM" (their gate is cleared by PollAtmState/the create callback, never by name).
+        private void MarkOrderPending(string signal)
+        {
+            _pendingSignal        = signal;
+            _orderPending         = true;
+            _orderPendingSinceUtc = DateTime.UtcNow;
+        }
 
         // One-slot signal queue — see THREADING note in the header. OnMarketData (market-data
         // thread) writes; OnBarUpdate (strategy thread) reads and clears. Overwrite semantics:
@@ -249,7 +267,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _dayStartRealized = 0;
                 _dailyLockout     = false;
                 _lastResetBar     = -1;
-                _orderPending     = false;
+                _orderPending         = false;
+                _pendingSignal        = string.Empty;
+                _orderPendingSinceUtc = DateTime.MinValue;
                 _signalQueued     = false;
                 _signalIsBuy      = false;
                 _signalVolume     = 0;
@@ -304,6 +324,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             // bar-0 guard: TrueRange(0) reads Close[1], which doesn't exist on the first bar.
             if (CurrentBar >= 1)
                 _atrSeries[0] = ComputeAtr();
+
+            // Watchdog: a submission NT8 silently ignores produces no order events, so nothing
+            // would ever clear _orderPending — and with it stuck, every gate in the strategy
+            // (entries, reversals, the daily-target flatten) stays locked for the session.
+            // WALL clock on purpose — the deliberate exception to this file's tape-time rule:
+            // order-event latency is a system property, and under accelerated Playback 30 tape-
+            // seconds elapse in under a second of real time, which would reset the gate while a
+            // real order is still in flight (audit 2026-07-29). 60 real seconds without any
+            // event for a market order is genuinely dead. Native mode only — ATM legs have
+            // their own dead-order detection in PollAtmState(). Runs BEFORE the governor so a
+            // freed gate lets a blocked lockout-flatten fire this same tick.
+            if (_orderPending && !IsAtmMode && _orderPendingSinceUtc != DateTime.MinValue &&
+                (DateTime.UtcNow - _orderPendingSinceUtc).TotalSeconds > 60)
+            {
+                Print("[BigPrints] WARNING: order pending 60s+ (wall clock) with no order events — submission presumed ignored; resetting the gate.");
+                _orderPending = false;
+            }
 
             PollAtmState();
             CheckRiskGovernor();
@@ -603,7 +640,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     _atmClosing      = true;
                     _atmReverseToBuy = null; // plain flatten — no reversal queued behind this close
-                    _orderPending    = true;
+                    MarkOrderPending("ATM");
                     Print(string.Format("[BigPrints] ATM close submitted: flatten ({0})", signalName));
                     AtmStrategyClose(_atmStrategyId);
                 }
@@ -616,13 +653,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             // fromEntrySignal = attach the exit to ALL entries.
             if (Position.MarketPosition == MarketPosition.Long)
             {
+                MarkOrderPending(signalName);
                 ExitLong(signalName, "");
-                _orderPending = true;
             }
             else if (Position.MarketPosition == MarketPosition.Short)
             {
+                MarkOrderPending(signalName);
                 ExitShort(signalName, "");
-                _orderPending = true;
             }
         }
 
@@ -846,11 +883,15 @@ namespace NinjaTrader.NinjaScript.Strategies
             _lastStopSent    = 0;
         }
 
-        // Arms the initial ATR brackets for the next entry/reversal: stop = AtrStopMult x ATR
-        // (NO tick cap by design — Daily Loss Limit is the USD backstop), target = stop x
-        // RewardMultiple. Ticks mode here; the trail later switches the live stop to Price mode.
-        // Returns false (skip the signal) while ATR isn't warmed up yet.
-        private bool ArmBrackets()
+        // Arms the initial ATR brackets for the entry/reversal about to be submitted: stop =
+        // AtrStopMult x ATR (NO tick cap by design — Daily Loss Limit is the USD backstop),
+        // target = stop x RewardMultiple. Ticks mode here; the trail later switches the live
+        // stop to Price mode. Returns false (skip the signal) while ATR isn't warmed up yet.
+        // ONLY the entered side's signal is armed (audit 2026-07-29): SetStopLoss on the HELD
+        // side during a reversal re-prices that position's LIVE working stop back to full
+        // fresh-ATR width — and if the reversal entry then gets rejected, the position is left
+        // wider than its breakeven/trail floor with the tracker desynced.
+        private bool ArmBrackets(bool isBuy)
         {
             double atr = CurrentBar >= 1 ? _atrSeries[0] : 0.0;
             if (CurrentBar < AtrPeriod || atr <= 0)
@@ -861,13 +902,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             int stopT = Math.Max(1, (int)Math.Round(AtrStopMult * atr / TickSize));
             int tgtT  = Math.Max(1, (int)Math.Round(stopT * RewardMultiple));
-            SetStopLoss("BigPrintLong",  CalculationMode.Ticks, stopT, false);
-            SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
-            SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
-            SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
+            string sig = isBuy ? "BigPrintLong" : "BigPrintShort";
+            SetStopLoss(sig,     CalculationMode.Ticks, stopT, false);
+            SetProfitTarget(sig, CalculationMode.Ticks, tgtT);
             _pendingStopTicks = stopT;
-            Print(string.Format("[BigPrints] Brackets armed: stop {0}t (={1:0.0} x ATR), target {2}t (={3:0.0}R)",
-                stopT, AtrStopMult, tgtT, RewardMultiple));
+            Print(string.Format("[BigPrints] Brackets armed ({0}): stop {1}t (={2:0.0} x ATR), target {3}t (={4:0.0}R)",
+                sig, stopT, AtrStopMult, tgtT, RewardMultiple));
             return true;
         }
 
@@ -1016,34 +1056,34 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (!PassesCooldown(isBuy, volume, now))
                     return; // consumed — not queued for later
-                if (!ArmBrackets())
+                if (!ArmBrackets(isBuy))
                     return; // ATR not warmed up yet
 
+                MarkOrderPending(isBuy ? "BigPrintLong" : "BigPrintShort"); // BEFORE Enter* — the fill can process first (see _orderPending)
                 if (isBuy) EnterLong(gov, "BigPrintLong");
                 else       EnterShort(gov, "BigPrintShort");
-                _orderPending = true;
                 Print(string.Format("[BigPrints] Native entry submitted: {0} x{1}", isBuy ? "BUY" : "SELL", gov));
             }
             else if (pos == MarketPosition.Long && !isBuy)
             {
                 if (!PassesReversalFilter(true, isBuy, now))
                     return; // consumed — position rides, no reversal
-                if (!ArmBrackets())
+                if (!ArmBrackets(false))
                     return;
 
+                MarkOrderPending("BigPrintShort");
                 EnterShort(gov, "BigPrintShort");
-                _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: SELL x{0}", gov));
             }
             else if (pos == MarketPosition.Short && isBuy)
             {
                 if (!PassesReversalFilter(false, isBuy, now))
                     return;
-                if (!ArmBrackets())
+                if (!ArmBrackets(true))
                     return;
 
+                MarkOrderPending("BigPrintLong");
                 EnterLong(gov, "BigPrintLong");
-                _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: BUY x{0}", gov));
             }
             // else: same-direction cluster while already positioned — stay in, do nothing.
@@ -1083,7 +1123,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 _atmClosing      = true;
                 _atmReverseToBuy = isBuy;
-                _orderPending    = true;
+                MarkOrderPending("ATM");
                 Print(string.Format("[BigPrints] ATM close submitted: reversal to {0}", isBuy ? "BUY" : "SELL"));
                 AtmStrategyClose(_atmStrategyId);
             }
@@ -1094,7 +1134,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 _atmClosing      = true;
                 _atmReverseToBuy = isBuy;
-                _orderPending    = true;
+                MarkOrderPending("ATM");
                 Print(string.Format("[BigPrints] ATM close submitted: reversal to {0}", isBuy ? "BUY" : "SELL"));
                 AtmStrategyClose(_atmStrategyId);
             }
@@ -1109,7 +1149,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             _atmOrderId    = GetAtmStrategyUniqueId();
             _atmStrategyId = GetAtmStrategyUniqueId();
             _atmPending    = true;
-            _orderPending  = true;
+            MarkOrderPending("ATM");
 
             string thisAtmId = _atmStrategyId; // capture — a reversal can overwrite the field before this fires
 
@@ -1155,7 +1195,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             OrderState state = execution.Order.OrderState;
             if (state == OrderState.Filled || state == OrderState.Cancelled || state == OrderState.Rejected)
             {
-                _orderPending = false;
+                // NAME-GATED clear (audit 2026-07-29): only the tracked submission's own
+                // terminal event may reopen the gate. An OLD bracket ("Stop loss"/"Profit
+                // target") whose fill races a just-submitted reversal entry must NOT clear it —
+                // that reopened the double-submission window the flag exists to close.
+                if (execution.Order.Name == _pendingSignal)
+                    _orderPending = false;
 
                 // Cooldown clock: this fires on any terminal fill for this strategy — entry OR a
                 // bracket exit (stop/target) — so a flat check here correctly captures a bracket
@@ -1194,7 +1239,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Failed CHANGE (e.g. the modify lost a race against a fast market): the
                     // order keeps working at its previous, still-valid price — benign. Resync
                     // the trail tracker to reality so later dedupes compare the right level.
-                    if (stopPrice > 0)
+                    // Side gate (audit 2026-07-29): a DELAYED rejection belonging to the
+                    // previous trade can land after a reversal re-seeded the tracker — its
+                    // OrderAction won't match the current position's protective side, and
+                    // accepting it would freeze the trail behind the hands-off check.
+                    bool matchesSide = Position.MarketPosition == MarketPosition.Long
+                        ? order.OrderAction == OrderAction.Sell
+                        : Position.MarketPosition == MarketPosition.Short && order.OrderAction == OrderAction.BuyToCover;
+                    if (matchesSide && stopPrice > 0)
                         _lastStopSent = stopPrice;
                     Print(string.Format("[BigPrints] Stop change failed ({0}) — stop still working @ {1}.", error, stopPrice));
                 }
@@ -1206,10 +1258,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            // Same name gate as OnExecutionUpdate: only the tracked submission's own terminal
+            // state clears the gate. This inherently excludes NT8's auto-cancel of a reversal's
+            // old bracket (Name "Stop loss", never the pending signal).
             if ((orderState == OrderState.Rejected || orderState == OrderState.Cancelled) &&
-                (order.Name == "BigPrintLong" || order.Name == "BigPrintShort" ||
-                 order.Name == "BigPrintRiskGovernor" || order.Name == "BigPrintSessionEnd" ||
-                 order.Name == "BigPrintGovernor" || order.Name == "BigPrintStopFail"))
+                order.Name == _pendingSignal)
                 _orderPending = false;
         }
 
