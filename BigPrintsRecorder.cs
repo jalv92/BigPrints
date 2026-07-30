@@ -224,6 +224,7 @@ namespace NinjaTrader.NinjaScript.Indicators
             _book   = new Queue<BookSnap>();
             _others = new List<ClusterInfo>();
             _trigger = null;
+            _lastBookSnapAt = default(DateTime);
         }
 
         // Detach the buffers, go Off, hand the payload to a background writer task.
