@@ -238,6 +238,20 @@ Compiled outside NT8 with [nt8c](https://github.com/jalv92) (Roslyn parity with 
 
 MIT — see [LICENSE](LICENSE).
 
+## Event Recorder (Playback diagnosis)
+
+Set **Enable Recorder** on the indicator to get a **Record** button on the chart
+(Playback tool). Click it ~1 minute *before* an expected big print: the button turns
+`ARMED…` and the recorder buffers tape (including inside-spread prints), best bid/ask
+size updates and top-10 L2 snapshots (250 ms) in RAM. The next cluster ≥ Min Volume
+turns it `REC…`, captures 120 s more, then writes one JSON to
+`Documents/NinjaTrader 8/BigPrintsAI/recordings/YYYY-MM-DD/` and disarms. Click while
+armed to cancel; click while recording to finalize early (partial file). Playback
+rewinds/jumps discard the buffer automatically.
+
+Validate a capture: `python3 tools/validate_recording.py <recording.json>`.
+Design: workspace `docs/superpowers/specs/2026-07-30-bigprints-event-recorder-design.md`.
+
 ## Disclaimer
 
 This software is provided for educational and research purposes. Trading futures involves substantial risk of loss. Nothing here is financial advice, the AI Advisor's output least of all. Test in Market Replay and on a simulated account before risking real money, and read the risk warning under [Strategy parameters](#parameters--strategy-bigprintsstrategycs).
