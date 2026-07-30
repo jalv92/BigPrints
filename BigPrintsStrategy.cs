@@ -84,6 +84,8 @@ using NinjaTrader.NinjaScript;
 //   - ConnectionLossHandling left at its NT8 default — no custom reconnect/flatten policy.
 namespace NinjaTrader.NinjaScript.Strategies
 {
+    public enum BigPrintsEntryMode { Immediate, Discriminator }
+
     public class BigPrintsStrategy : Strategy
     {
         // --- Level-I state (mirrors BigPrints.cs) ---
@@ -188,6 +190,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         private long     _signalVolume;
         private DateTime _signalTime;
 
+        // ---- Discriminator entry (spec 2026-07-30) ----------------------------------
+        // Engine exists whenever it has work (Discriminator mode OR logging); null
+        // otherwise so every hook is a no-op via `_disc?.`. Fed ONLY from OnMarketData.
+        private BigPrintsDiscriminator _disc;
+        private long   _clusterMaxPrint;   // largest single print in the open cluster
+        private int    _clusterPrintCount;
+        private double _clusterExtreme;    // lowest price in a sell cluster / highest in a buy
+
+        // Decision queue: same one-slot volatile pattern as the signal queue. Payload
+        // (reference assignment, atomic) BEFORE the flag.
+        private volatile bool _decisionQueued;
+        private BigPrintsDiscriminator.Evaluation _decisionEval;
+
         // Aggression-balance reversal filter (feature 2). Ledger of every drained signal (traded
         // or not) within a rolling AggressionWindowSeconds window, used ONLY at the reversal
         // decision to require the new side's recent volume to dominate the held side's — filters
@@ -262,6 +277,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 AggressionWindowSeconds = 180;
                 ReversalDominanceRatio  = 1.5;
                 CooldownMinutes         = 5;
+                EntryMode               = BigPrintsEntryMode.Immediate;
+                EnableDiscriminatorLog  = true;
             }
             else if (State == State.Configure)
             {
@@ -309,6 +326,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _pendingStopTicks = 0;
                 _stopOrderFailed  = false;
                 ResetTradeState();
+
+                _decisionQueued = false;
+                _decisionEval   = null;
+                _clusterMaxPrint = 0; _clusterPrintCount = 0; _clusterExtreme = 0;
+                if (EntryMode == BigPrintsEntryMode.Discriminator || EnableDiscriminatorLog)
+                {
+                    _disc = new BigPrintsDiscriminator(TickSize)
+                    {
+                        LoggingEnabled = EnableDiscriminatorLog,
+                        Log = msg => Print(msg),
+                    };
+                }
 
                 // Shared-governor: wipe this account's registry entry so a Playback rewind
                 // (which resets the account) starts clean; instances re-register on their next
@@ -414,7 +443,24 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Ledger BEFORE the gates in TryEnter — a signal that gets skipped (pending/
                 // lockout/session) is still real tape flow for the reversal dominance filter.
                 RecordAggression(_signalIsBuy, _signalVolume, _signalTime);
-                TryEnter(_signalIsBuy, _signalVolume, _signalTime);
+                if (EntryMode == BigPrintsEntryMode.Immediate)
+                    TryEnter(_signalIsBuy, _signalVolume, _signalTime);
+                // Discriminator mode: the cluster only feeds the ledger; entries come from
+                // the decision queue below once T1/T2/T3 have spoken.
+            }
+
+            if (_decisionQueued)
+            {
+                _decisionQueued = false;
+                BigPrintsDiscriminator.Evaluation dec = _decisionEval;
+                _decisionEval = null;
+                if (dec != null)
+                {
+                    string result = TryEnter(dec.EnterLong, dec.Volume, dec.DecisionTime);
+                    if (EnableDiscriminatorLog)
+                        DiscriminatorLog.AppendTrigger(dec, EntryMode.ToString(),
+                            result == "entered" ? (dec.EnterLong ? "long" : "short") : result);
+                }
             }
         }
 
@@ -555,6 +601,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             _dailyLockout        = false;
             _consecLosses   = 0;
             _govHaltedToday = false;
+            _disc?.Reset();  // session boundary: history/pending/outcome all restart (spec §7)
 
             // Account-wide baseline day for the shared daily governor: the registry entry for
             // this account+day is fetched-or-created per tick in CurrentAccountDay(), so all
@@ -813,6 +860,26 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ATM flat-transition it detects without a per-fill time of its own (see cooldown).
             _lastTapeTime = e.Time;
 
+            // Discriminator heartbeat on every event type: resolves a pending evaluation
+            // once it crosses t_end + 5s. Must run BEFORE the cluster-timeout finalize
+            // below — otherwise a cluster finalized by this same event would supersede an
+            // evaluation that was already due.
+            BigPrintsDiscriminator.Evaluation ev = _disc?.TryEvaluate(e.Time);
+            if (ev != null)
+            {
+                if (EntryMode == BigPrintsEntryMode.Discriminator &&
+                    ev.Decision != BigPrintsDiscriminator.Verdict.Abstain)
+                {
+                    _decisionEval   = ev;   // payload before flag (volatile publish)
+                    _decisionQueued = true;
+                }
+                else if (EnableDiscriminatorLog)
+                {
+                    DiscriminatorLog.AppendTrigger(ev, EntryMode.ToString(),
+                        EntryMode == BigPrintsEntryMode.Immediate ? "immediate_entry" : "no_trade");
+                }
+            }
+
             // Tape-clock timeout: quotes keep flowing even when prints pause, so ANY event type
             // (Bid/Ask/Last) more than ClusterMilliseconds after the cluster's last print is the
             // silence-breaker that finalizes it — lower latency than waiting for the next Last
@@ -846,6 +913,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             else
                 return; // print landed strictly between bid/ask — no clear aggressor, skip
 
+            _disc?.OnPrint(e.Time, e.Price, e.Volume, isBuy);
+
             if (_clusterOpen &&
                 isBuy == _clusterIsBuy &&
                 (e.Time - _clusterLastTime).TotalMilliseconds <= ClusterMilliseconds &&
@@ -854,6 +923,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Same side, within the sweep window and the hard wall-clock cap — fold into the cluster.
                 _clusterVolume  += e.Volume;
                 _clusterLastTime = e.Time;
+                _clusterPrintCount++;
+                if (e.Volume > _clusterMaxPrint) _clusterMaxPrint = e.Volume;
+                _clusterExtreme = _clusterIsBuy ? Math.Max(_clusterExtreme, e.Price)
+                                                : Math.Min(_clusterExtreme, e.Price);
                 return;
             }
 
@@ -865,6 +938,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             _clusterVolume    = e.Volume;
             _clusterLastTime  = e.Time;
             _clusterStartTime = e.Time;
+            _clusterMaxPrint   = e.Volume;
+            _clusterPrintCount = 1;
+            _clusterExtreme    = e.Price;
         }
 
         // ponytail: unlike BigPrints.cs, there is no Terminated-time flush here — a strategy has
@@ -886,6 +962,18 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             Print(string.Format("[BigPrints] Cluster {0} {1} contracts @ {2:HH:mm:ss.fff}",
                 _clusterIsBuy ? "BUY" : "SELL", _clusterVolume, now));
+
+            // Discriminator feed + trigger logging (both modes). A superseded pending
+            // evaluation comes back partially evaluated for the log.
+            if (_disc != null)
+            {
+                int spanMs = (int)(_clusterLastTime - _clusterStartTime).TotalMilliseconds;
+                BigPrintsDiscriminator.Evaluation superseded = _disc.OnClusterFinalized(
+                    _clusterStartTime, _clusterLastTime, _clusterIsBuy, _clusterVolume,
+                    _clusterMaxPrint, _clusterExtreme, spanMs, _clusterPrintCount);
+                if (superseded != null && EnableDiscriminatorLog)
+                    DiscriminatorLog.AppendTrigger(superseded, EntryMode.ToString(), "superseded");
+            }
 
             // Cold signal — the cluster's last print is too far behind "now" to still be
             // actionable. With the tape-clock timeout in OnMarketData now finalizing clusters
@@ -913,28 +1001,27 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Native mode arms ATR brackets per entry (ArmBrackets) and manages them per tick
         // (ManageTradeStops: breakeven + order-flow trailing). ATM mode gets its stop/target
         // from the template instead (see AtmTemplateName).
-        private void TryEnter(bool isBuy, long volume, DateTime marketTime)
+        private string TryEnter(bool isBuy, long volume, DateTime marketTime)
         {
             if (_orderPending)
             {
                 Print("[BigPrints] Cluster not traded: an order/ATM operation is already pending.");
-                return;
+                return "pending";
             }
             if (_dailyLockout)
             {
                 Print("[BigPrints] Cluster not traded: daily lockout active.");
-                return;
+                return "lockout";
             }
             if (!InSession(marketTime))
             {
                 Print("[BigPrints] Cluster not traded: outside the session window.");
-                return;
+                return "session";
             }
 
-            if (IsAtmMode)
-                TryEnterAtm(isBuy, volume, marketTime);
-            else
-                TryEnterNative(isBuy, volume, marketTime);
+            return IsAtmMode
+                ? TryEnterAtm(isBuy, volume, marketTime)
+                : TryEnterNative(isBuy, volume, marketTime);
         }
 
         // Cooldown gate — fresh entries from flat ONLY; reversals are exempt (governed by the
@@ -1159,7 +1246,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // managed-approach order (close + open), per NT8's documented Entry() reversal behavior
         // — no separate Exit() call needed. Reversal branches are gated by the aggression-balance
         // filter (feature 2); the flat-entry branch is gated by the cooldown instead (never both).
-        private void TryEnterNative(bool isBuy, long volume, DateTime now)
+        private string TryEnterNative(bool isBuy, long volume, DateTime now)
         {
             MarketPosition pos = Position.MarketPosition;
 
@@ -1172,44 +1259,48 @@ namespace NinjaTrader.NinjaScript.Strategies
                     FlattenNow("BigPrintGovernor");
                 else if (pos == MarketPosition.Flat)
                     Print(string.Format("[BigPrints] governor SKIP signal at {0}", Time[0]));
-                return;
+                return "gov_skip";
             }
 
             if (pos == MarketPosition.Flat)
             {
                 if (!PassesCooldown(isBuy, volume, now))
-                    return; // consumed — not queued for later
+                    return "cooldown"; // consumed — not queued for later
                 if (!ArmBrackets(isBuy))
-                    return; // ATR not warmed up yet
+                    return "atr_not_ready"; // ATR not warmed up yet
 
                 MarkOrderPending(isBuy ? "BigPrintLong" : "BigPrintShort"); // BEFORE Enter* — the fill can process first (see _orderPending)
                 if (isBuy) EnterLong(gov, "BigPrintLong");
                 else       EnterShort(gov, "BigPrintShort");
                 Print(string.Format("[BigPrints] Native entry submitted: {0} x{1}", isBuy ? "BUY" : "SELL", gov));
+                return "entered";
             }
-            else if (pos == MarketPosition.Long && !isBuy)
+            if (pos == MarketPosition.Long && !isBuy)
             {
                 if (!PassesReversalFilter(true, isBuy, now))
-                    return; // consumed — position rides, no reversal
+                    return "reversal_filter"; // consumed — position rides, no reversal
                 if (!ArmBrackets(false))
-                    return;
+                    return "atr_not_ready";
 
                 MarkOrderPending("BigPrintShort");
                 EnterShort(gov, "BigPrintShort");
                 Print(string.Format("[BigPrints] Native reversal submitted: SELL x{0}", gov));
+                return "entered";
             }
-            else if (pos == MarketPosition.Short && isBuy)
+            if (pos == MarketPosition.Short && isBuy)
             {
                 if (!PassesReversalFilter(false, isBuy, now))
-                    return;
+                    return "reversal_filter";
                 if (!ArmBrackets(true))
-                    return;
+                    return "atr_not_ready";
 
                 MarkOrderPending("BigPrintLong");
                 EnterLong(gov, "BigPrintLong");
                 Print(string.Format("[BigPrints] Native reversal submitted: BUY x{0}", gov));
+                return "entered";
             }
-            // else: same-direction cluster while already positioned — stay in, do nothing.
+            // Same-direction cluster while already positioned — stay in, do nothing.
+            return "same_side";
         }
 
         // ATM mode: reversal is two async steps (unlike native's single-order reverse) — close
@@ -1217,7 +1308,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // _atmReverseToBuy carries the queued direction across that gap. Reversal branches are
         // gated by the aggression-balance filter (feature 2); the flat-entry branch is gated by
         // the cooldown instead (never both — a reversal is exempt from cooldown by design).
-        private void TryEnterAtm(bool isBuy, long volume, DateTime now)
+        private string TryEnterAtm(bool isBuy, long volume, DateTime now)
         {
             MarketPosition atmPos;
             if (string.IsNullOrEmpty(_atmStrategyId))
@@ -1228,40 +1319,44 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 MarketPosition? atmPosOpt = SafeGetAtmMarketPosition(_atmStrategyId);
                 if (atmPosOpt == null)
-                    return; // transient exception already printed — this signal is dropped, not queued (matches TryEnter's other no-op gates)
+                    return "atm_transient"; // transient exception already printed — this signal is dropped, not queued (matches TryEnter's other no-op gates)
                 atmPos = atmPosOpt.Value;
             }
 
             if (atmPos == MarketPosition.Flat)
             {
                 if (!PassesCooldown(isBuy, volume, now))
-                    return; // consumed — not queued for later
+                    return "cooldown"; // consumed — not queued for later
 
                 CreateAtm(isBuy);
+                return "entered";
             }
-            else if (atmPos == MarketPosition.Long && !isBuy)
+            if (atmPos == MarketPosition.Long && !isBuy)
             {
                 if (!PassesReversalFilter(true, isBuy, now))
-                    return; // consumed — position rides, no reversal
+                    return "reversal_filter"; // consumed — position rides, no reversal
 
                 _atmClosing      = true;
                 _atmReverseToBuy = isBuy;
                 MarkOrderPending("ATM");
                 Print(string.Format("[BigPrints] ATM close submitted: reversal to {0}", isBuy ? "BUY" : "SELL"));
                 AtmStrategyClose(_atmStrategyId);
+                return "entered";
             }
-            else if (atmPos == MarketPosition.Short && isBuy)
+            if (atmPos == MarketPosition.Short && isBuy)
             {
                 if (!PassesReversalFilter(false, isBuy, now))
-                    return;
+                    return "reversal_filter";
 
                 _atmClosing      = true;
                 _atmReverseToBuy = isBuy;
                 MarkOrderPending("ATM");
                 Print(string.Format("[BigPrints] ATM close submitted: reversal to {0}", isBuy ? "BUY" : "SELL"));
                 AtmStrategyClose(_atmStrategyId);
+                return "entered";
             }
-            // else: same-direction cluster while already positioned — stay in, do nothing.
+            // Same-direction cluster while already positioned — stay in, do nothing.
+            return "same_side";
         }
 
         private void CreateAtm(bool isBuy)
@@ -1518,6 +1613,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "ATM Template Name", Description = "Empty = native mode (managed EnterLong/EnterShort with ATR brackets). Set to an ATM template name to route entries through that ATM — SL/TP are then managed by the template and ALL of 02. Trade Management is ignored.", Order = 1, GroupName = "06. ATM")]
         public string AtmTemplateName { get; set; }
+
+        // ── 07. Discriminator Entry ─────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Display(Name = "Entry Mode", Description = "Immediate = v1: enter with the cluster the moment it fires. Discriminator = wait 5s after the cluster and enter only when >=2 of the pre-registered T1/T2/T3 discriminators agree (reversal -> fade the sweep, continuation -> follow it). Thresholds are frozen constants (audit 2026-07-30), not parameters.", Order = 1, GroupName = "07. Discriminator Entry")]
+        public BigPrintsEntryMode EntryMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Discriminator Log", Description = "Log every cluster >= Min Volume with its T1/T2/T3 values, votes, action and eventual outcome label to BigPrintsAI/discriminator_log.jsonl — in BOTH entry modes. This is the validation corpus; leave it on.", Order = 2, GroupName = "07. Discriminator Entry")]
+        public bool EnableDiscriminatorLog { get; set; }
         #endregion
     }
 }
