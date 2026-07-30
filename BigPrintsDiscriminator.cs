@@ -65,10 +65,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             public Verdict Decision;           // Abstain = no trade
             public bool    EnterLong;          // valid when Decision != Abstain
             public bool    Superseded;
+            public string  Instrument;         // e.g. "NQ 09-26" — disambiguates the corpus when multiple markets log concurrently
         }
 
         private readonly double _tickSize;
-        public BigPrintsDiscriminator(double tickSize) { _tickSize = tickSize; }
+        private readonly string _instrument;
+        public BigPrintsDiscriminator(double tickSize, string instrument) { _tickSize = tickSize; _instrument = instrument; }
 
         // ---- rolling per-side print history (T1) ------------------------------------
         private struct Pr { public DateTime T; public long Size; }
@@ -206,12 +208,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Opens a new pending evaluation (computing T1 immediately) and a new outcome
         // tracker. Returns the superseded pending evaluation (partial data, Decision forced
         // to Abstain) for the caller to log, or null.
+        // Note: no JumpCheck(tEnd) here — tEnd is the cluster's LAST PRINT time, which can
+        // legitimately trail _lastSeen (already advanced by TryEvaluate/OnPrint on this same
+        // or a later event) by more than BackwardsTolSecs on a cold cluster. That is normal
+        // forward flow, not a rewind. A genuine playback rewind is always caught first by
+        // JumpCheck inside TryEvaluate/OnPrint, which runs before this on the same event.
         public Evaluation OnClusterFinalized(DateTime tStart, DateTime tEnd, bool isBuy,
             long volume, long maxPrint, double sweepExtreme, int spanMs, int nPrints)
         {
-            if (!JumpCheck(tEnd))
-                return null;
-
             Evaluation superseded = null;
             if (_pending != null)
             {
@@ -229,7 +233,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 TriggerStart = tStart, TriggerTime = tEnd, IsBuySweep = isBuy,
                 Volume = volume, MaxPrint = maxPrint, SweepExtreme = sweepExtreme,
-                SpanMs = spanMs, NPrints = nPrints,
+                SpanMs = spanMs, NPrints = nPrints, Instrument = _instrument,
             };
             ComputeT1(p);
             _pending = p;
@@ -372,7 +376,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             Log(string.Format("[BigPrints/disc] outcome {0}: extension {1:0}t, recovery {2:0}%",
                 label, extTicks, recovery * 100));
             if (LoggingEnabled)
-                DiscriminatorLog.AppendOutcome(o.TriggerTime, label, extTicks, recovery * 100, o.Extreme, t);
+                DiscriminatorLog.AppendOutcome(o.TriggerTime, _instrument, label, extTicks, recovery * 100, o.Extreme, t);
         }
 
         private void CloseOutcome(DateTime t, string label)
@@ -383,7 +387,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             _outcome = null;
             double extTicks = Math.Abs(o.SweepExtreme - o.Extreme) / _tickSize;
             if (LoggingEnabled)
-                DiscriminatorLog.AppendOutcome(o.TriggerTime, label, extTicks, 0, o.Extreme, t);
+                DiscriminatorLog.AppendOutcome(o.TriggerTime, _instrument, label, extTicks, 0, o.Extreme, t);
         }
     }
 
@@ -417,6 +421,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 ["type"] = "trigger",
                 ["ts"] = e.TriggerTime.ToString("o"),
+                ["instrument"] = e.Instrument,
                 ["mode"] = mode,
                 ["side"] = e.IsBuySweep ? "buy" : "sell",
                 ["volume"] = e.Volume,
@@ -432,13 +437,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
-        public static void AppendOutcome(DateTime triggerTs, string label, double extensionTicks,
-            double recoveryPct, double extremePrice, DateTime resolvedTs)
+        public static void AppendOutcome(DateTime triggerTs, string instrument, string label,
+            double extensionTicks, double recoveryPct, double extremePrice, DateTime resolvedTs)
         {
             Append(new JObject
             {
                 ["type"] = "outcome",
                 ["trigger_ts"] = triggerTs.ToString("o"),
+                ["instrument"] = instrument,
                 ["label"] = label,
                 ["extension_ticks"] = extensionTicks,
                 ["recovery_pct"] = recoveryPct,

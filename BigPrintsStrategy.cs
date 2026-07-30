@@ -203,6 +203,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private volatile bool _decisionQueued;
         private BigPrintsDiscriminator.Evaluation _decisionEval;
 
+        // The engine is single-threaded-by-construction (fed exclusively from OnMarketData —
+        // see BigPrintsDiscriminator's threading note). DailyReset() runs on the strategy
+        // thread (OnBarUpdate), so it can't call _disc.Reset() directly — it only requests one;
+        // OnMarketData drains the request on its own thread before doing anything else with _disc.
+        private volatile bool _discResetRequested;
+
         // Aggression-balance reversal filter (feature 2). Ledger of every drained signal (traded
         // or not) within a rolling AggressionWindowSeconds window, used ONLY at the reversal
         // decision to require the new side's recent volume to dominate the held side's — filters
@@ -330,9 +336,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _decisionQueued = false;
                 _decisionEval   = null;
                 _clusterMaxPrint = 0; _clusterPrintCount = 0; _clusterExtreme = 0;
+                _discResetRequested = false;
                 if (EntryMode == BigPrintsEntryMode.Discriminator || EnableDiscriminatorLog)
                 {
-                    _disc = new BigPrintsDiscriminator(TickSize)
+                    _disc = new BigPrintsDiscriminator(TickSize, Instrument.FullName)
                     {
                         LoggingEnabled = EnableDiscriminatorLog,
                         Log = msg => Print(msg),
@@ -601,7 +608,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             _dailyLockout        = false;
             _consecLosses   = 0;
             _govHaltedToday = false;
-            _disc?.Reset();  // session boundary: history/pending/outcome all restart (spec §7)
+            // Session boundary: history/pending/outcome all restart (spec §7). DailyReset runs
+            // on the strategy thread — the engine may only be touched from OnMarketData (see
+            // the threading note on _discResetRequested), so this only requests the reset;
+            // OnMarketData performs it on its own thread.
+            _discResetRequested = true;
 
             // Account-wide baseline day for the shared daily governor: the registry entry for
             // this account+day is fetched-or-created per tick in CurrentAccountDay(), so all
@@ -855,6 +866,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (CurrentBar < 0 || State != State.Realtime)
                 return;
+
+            // Cross-thread reset handoff (see _discResetRequested field comment): the engine
+            // is only ever touched from this thread, so a reset requested by DailyReset (on
+            // the strategy thread) is applied here, before anything else uses _disc this tick.
+            if (_discResetRequested)
+            {
+                _discResetRequested = false;
+                _disc?.Reset();
+            }
 
             // Freshest tape time, for every event type — used by PollAtmState to timestamp an
             // ATM flat-transition it detects without a per-fill time of its own (see cooldown).
