@@ -125,20 +125,57 @@ A **1-minute chart** works well for live monitoring. Detection itself is timefra
 
 ## Parameters — strategy (`BigPrintsStrategy.cs`)
 
+Parameters are grouped in the NT8 property grid (numeric prefixes keep the order):
+
+**01. Signal**
+
 | Parameter | Default | Meaning |
 |---|---|---|
 | Min Volume | 150 | Minimum total contracts in a cluster to trade it |
 | Cluster Milliseconds | 150 | Max gap between same-side prints to still count as one sweep |
-| Contracts | 1 | Quantity per entry/reversal. Native mode only — ATM mode sizes from the template |
-| Session Start / End (HHmm) | 930 / 1555 | Entries allowed only inside this window; flattens outside it |
-| Daily Profit Target / Loss Limit (USD) | 500 / 300 | Flatten + lock out entries for the rest of the day once hit. 0 = disabled. Net of commission |
-| ATM Template Name | *(empty)* | Empty = native mode (managed orders). Set = ATM mode (SL/TP come from the template) |
-| Stop Loss / Profit Target (ticks) | 0 / 0 | Native-mode per-trade bracket. **0 = disabled**, ignored in ATM mode |
-| Aggression Window (sec) | 180 | Lookback for the reversal dominance filter |
-| Reversal Dominance Ratio | 1.5 | A reversal only fires if the new side's windowed volume is at least this many times the held side's |
+| Aggression Window (sec) | 180 | Lookback for the reversal dominance filter and the trailing-stop flow sensor |
+| Reversal Dominance Ratio | 1.5 | A reversal only fires if the new side's windowed volume is at least this many times the held side's. The trailing stop reuses it to decide flow dominance |
+
+**02. Trade Management** (native mode only — ATM mode uses the template's SL/TP)
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| ATR Period | 14 | ATR lookback (chart-series bars) for the stop and the trail |
+| ATR Stop Mult | 2.0 | Initial stop = this × ATR. **No tick cap** — the Daily Loss Limit is the USD backstop. Also the trail distance when tape flow is neutral |
+| Reward Multiple | 1.5 | Profit target = effective stop × this |
+| Breakeven Trigger (ticks) | 0 | Raise the stop floor to breakeven once price moves this far in favor. 0 = disabled |
+| Breakeven Offset (ticks) | 4 | Breakeven stop = entry ± this (covers commissions) |
+| Trailing Enabled | true | Chandelier ATR trail modulated by tape flow (see below) |
+| Trail Tight Mult | 1.0 | Trail k when OPPOSING windowed tape volume dominates — the stop hugs price |
+| Trail Wide Mult | 3.0 | Trail k when FAVORABLE windowed tape volume dominates — the stop breathes |
 | Trade Cooldown (min) | 5 | Minimum rest after a trade closes before a new entry from flat. 0 = disabled. Does not block reversals |
 
-> ⚠️ **There is no per-trade stop unless you set one.** Both `Stop Loss (ticks)` and `Profit Target (ticks)` default to **0 = disabled**, which means that out of the box, in native mode, the only risk control is the daily USD loss limit. Set `Stop Loss (ticks)` to a non-zero value, or use ATM mode with a template that carries a stop, before running this on anything that matters.
+**03. Money Management**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| Contracts | 1 | Quantity per entry/reversal. Native mode only — ATM mode sizes from the template |
+| Daily Profit Target / Loss Limit (USD) | 500 / 300 | Flatten + lock out entries for the rest of the day once hit (includes open PnL). 0 = disabled. Net of commission |
+
+**04. Session**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| Session Start / End (HHmm) | 930 / 1555 | Entries allowed only inside this window; flattens outside it |
+
+**06. ATM**
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| ATM Template Name | *(empty)* | Empty = native mode (ATR brackets + trailing). Set = ATM mode (SL/TP come from the template; all of 02. Trade Management is ignored) |
+
+(05. Prop Governor is unchanged — see the Prop Governor section.)
+
+### How the trailing stop works
+
+The stop trails the best price since entry at a distance of k × ATR (chandelier), where k *breathes* with the tape: when opposing big-print volume dominates the aggression window (same dominance test as the reversal filter) the stop tightens to `Trail Tight Mult` × ATR; when favorable volume dominates it widens to `Trail Wide Mult` × ATR; neutral flow uses `ATR Stop Mult`. The stop can therefore retreat during a noisy pullback — but never below the **floor**: the initial stop price, raised to breakeven once the BE trigger fires. Worst case never worsens. The fixed profit target (Reward Multiple) coexists; first touch wins.
+
+> ⚠️ **Since v2 there is always a per-trade ATR stop in native mode.** The old `Stop Loss (ticks)` / `Profit Target (ticks)` parameters are gone; the stop has **no tick cap**, so on a violent day it can be wide — size accordingly and keep the Daily Loss Limit set.
 >
 > ATM mode is not supported by NT8 on a Playback account — the strategy logs a warning and you should prefer native mode when testing in Market Replay.
 

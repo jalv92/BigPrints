@@ -32,7 +32,7 @@ using NinjaTrader.NinjaScript;
 // Replay (both report State.Realtime, which the code below relies on).
 //
 // HYBRID ATM MODE (AtmTemplateName parameter — pattern mirrored from TBStrategy.cs in this repo):
-//   - Empty (default): NATIVE mode — EnterLong/EnterShort managed orders, no per-trade stop.
+//   - Empty (default): NATIVE mode — EnterLong/EnterShort managed orders with ATR brackets.
 //   - Set to an ATM template name: ATM mode — entries go through AtmStrategyCreate(); the
 //     template's own stop/target manage the exit. Reversal = AtmStrategyClose() on the live ATM,
 //     then a new AtmStrategyCreate() once it reports flat (see TryEnterAtm/PollAtmState). ATM
@@ -68,14 +68,15 @@ using NinjaTrader.NinjaScript;
 // — they use the same crashy NAudio path and nothing in NinjaScript can shield them. ATM mode
 // in Playback is NOT the process-killer — but NT staff still call ATM-from-NinjaScript
 // unsupported in Playback (forum 1298259: "ATM strategies only work in realtime... use managed
-// orders instead"), so native brackets (StopLossTicks/ProfitTargetTicks) remain the recommended
+// orders instead"), so native brackets (the ATR stop/target) remain the recommended
 // Playback mode. The threading marshal above stays (correct per NT8 rules).
 //
-// LIVE-MONEY GATE (not fixed in v1 by design) — read before enabling on a funded account:
-//   - NATIVE mode has no per-trade stop loss unless StopLossTicks/ProfitTargetTicks are set
-//     (both 0 = disabled, the original default) — either way, the daily USD governor always
-//     applies. ATM mode gets its stop/target from the template instead — see the PLAYBACK
-//     CRASH ROOT CAUSE above (ATM in Playback is fine; NT8 event sounds are not).
+// LIVE-MONEY GATE — read before enabling on a funded account:
+//   - NATIVE mode brackets are always on since v2: stop = AtrStopMult x ATR(AtrPeriod) with NO
+//     tick cap (accepted risk — on a violent day the stop is wide and the Daily Loss Limit
+//     governor is the only USD backstop), target = stop x RewardMultiple. ATM mode gets its
+//     stop/target from the template instead — see the PLAYBACK CRASH ROOT CAUSE above (ATM in
+//     Playback is fine; NT8 event sounds are not).
 //   - Daily PnL baseline (_dayStartRealized / _atmRealizedPnLToday) resets on strategy restart,
 //     not only on a new trading day — restarting mid-session re-baselines and can hide same-day PnL.
 //   - No account-position adoption (StartBehavior.WaitUntilFlat) — a manually-opened position
@@ -162,6 +163,21 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime _lastTapeTime;  // updated on every OnMarketData event, all three types
         private DateTime _lastFlatTime;  // when the position last closed; MinValue = no trade yet
 
+        // --- Trade management state (native mode only; see spec 2026-07-29) ---
+        // Initialized lazily by ManageTradeStops() on the first tick with a non-flat position
+        // (a direction flip re-initializes too, covering one-order reversals), reset on flat.
+        // ponytail: hand-rolled Wilder ATR instead of the ATR() system-indicator wrapper —
+        // nt8c's per-file check can't resolve system indicator wrappers (same gap as FVGFlow,
+        // see FVGFlowStrategy.cs). Math is identical to NinjaTrader's ATR indicator.
+        private Series<double> _atrSeries;
+        private int    _pendingStopTicks; // stop ticks computed at submission, consumed at init
+        private double _tradeEntryPrice;  // 0 = no active trade state
+        private bool   _tradeIsLong;
+        private double _tradeMaxFav;      // highest High (long) / lowest Low (short) since entry
+        private double _tradeFloor;       // hard floor: initial stop price, raised to BE once armed
+        private bool   _beArmed;
+        private double _lastStopSent;     // last price submitted via SetStopLoss(Price); 0 = none
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -185,8 +201,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DailyProfitTargetUSD = 500;
                 DailyLossLimitUSD    = 300;
                 AtmTemplateName      = "";    // empty = native mode
-                StopLossTicks        = 60;    // 15 pts NQ; raised at entry by the 1.5x 10-bar-range vol floor (audit #2)
-                ProfitTargetTicks    = 90;    // 22.5 pts NQ = 1.5R vs the static stop
+                AtrPeriod            = 14;
+                AtrStopMult          = 2.0;   // stop = 2 x ATR, no tick cap (accepted risk — see LIVE-MONEY GATE)
+                RewardMultiple       = 1.5;   // target = stop x this
+                BreakevenTriggerTicks = 0;    // 0 = breakeven disabled
+                BreakevenOffsetTicks  = 4;    // entry +/- 4 ticks once BE arms (covers commissions)
+                TrailingEnabled      = true;
+                TrailTightMult       = 1.0;   // k when opposing tape flow dominates
+                TrailWideMult        = 3.0;   // k when favorable tape flow dominates
                 GovTrailingDDRemaining = 0;    // 0 = governor disabled
                 GovHorizonsPerDay      = 6;
                 GovMaxConsecLosses     = 3;
@@ -201,22 +223,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // not off bar closes. The primary Bars series only supplies session/day-boundary
                 // context (Time[0], Bars.IsFirstBarOfSession) for the risk/session governor.
 
-                // Native-mode per-trade brackets (see PLAYBACK CRASH ROOT CAUSE in the header). Must be
-                // set here, before any entry is submitted, and tied to each entry's own signal
-                // name so the managed engine auto-attaches/replaces the bracket per entry/
-                // reversal. Naturally a no-op in ATM mode too: "BigPrintLong"/"BigPrintShort" are
-                // never used as entry signal names there (AtmStrategyCreate is used instead), so
-                // these brackets simply never have a matching entry to attach to.
-                if (StopLossTicks > 0)
-                {
-                    SetStopLoss("BigPrintLong",  CalculationMode.Ticks, StopLossTicks, false);
-                    SetStopLoss("BigPrintShort", CalculationMode.Ticks, StopLossTicks, false);
-                }
-                if (ProfitTargetTicks > 0)
-                {
-                    SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, ProfitTargetTicks);
-                    SetProfitTarget("BigPrintShort", CalculationMode.Ticks, ProfitTargetTicks);
-                }
+                // Native-mode per-trade brackets are armed per-entry in ArmBrackets() (ATR-based,
+                // so they can't be known here). Naturally a no-op in ATM mode: "BigPrintLong"/
+                // "BigPrintShort" are never used as entry signal names there (AtmStrategyCreate
+                // is used instead), so those brackets never have a matching entry to attach to.
             }
             else if (State == State.DataLoaded)
             {
@@ -235,6 +245,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _lastTapeTime     = DateTime.MinValue;
                 _lastFlatTime     = DateTime.MinValue; // no trade yet -> no cooldown
 
+                _atrSeries        = new Series<double>(this);
+                _pendingStopTicks = 0;
+                ResetTradeState();
+
                 _atmStrategyId       = string.Empty;
                 _atmOrderId          = string.Empty;
                 _atmPending          = false;
@@ -247,7 +261,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Playback (see PLAYBACK CRASH ROOT CAUSE header) — surface it in the output
                 // window every time, since the parameter choice is easy to forget between runs.
                 if (IsAtmMode && Account != null && Account.Name.StartsWith("Playback"))
-                    Print("[BigPrints] WARNING: ATM mode on a Playback account — NT8 does not support ATM-from-NinjaScript in Playback. Prefer native mode (StopLossTicks/ProfitTargetTicks) here.");
+                    Print("[BigPrints] WARNING: ATM mode on a Playback account — NT8 does not support ATM-from-NinjaScript in Playback. Prefer native mode (ATR brackets) here.");
             }
         }
 
@@ -271,9 +285,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ponytail: cluster lifecycle is driven entirely by tape-clock timeouts inside
             // OnMarketData (see header comment) — no bar-clock cluster hygiene belongs here.
 
+            // Known one-tick staleness vs the forming bar is fine — the trail reads [0] later
+            // this same call. Same recompute-every-tick pattern as FVGFlowStrategy.cs, plus a
+            // bar-0 guard: TrueRange(0) reads Close[1], which doesn't exist on the first bar.
+            if (CurrentBar >= 1)
+                _atrSeries[0] = ComputeAtr();
+
             PollAtmState();
             CheckRiskGovernor();
             CheckSessionEnd();
+            ManageTradeStops();
 
             // Drain the signal queue LAST, after the governor/session checks above have had a
             // chance to update _dailyLockout/_orderPending on fresh state for this tick.
@@ -564,14 +585,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            // Two-arg overload on purpose: ExitLong(string) is fromEntrySignal, NOT a signal
+            // name — no entry is named "BigPrintRiskGovernor", so NT8 silently ignored the exit
+            // and the daily lockout never actually flattened (bug found 2026-07-29). Empty
+            // fromEntrySignal = attach the exit to ALL entries.
             if (Position.MarketPosition == MarketPosition.Long)
             {
-                ExitLong(signalName);
+                ExitLong(signalName, "");
                 _orderPending = true;
             }
             else if (Position.MarketPosition == MarketPosition.Short)
             {
-                ExitShort(signalName);
+                ExitShort(signalName, "");
                 _orderPending = true;
             }
         }
@@ -710,10 +735,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         //   1. Flat            -> enter in the aggressor's direction.
         //   2. Opposite cluster while positioned -> reverse.
         //   3. Same-direction cluster while positioned -> no-op, stay in.
-        // Native v1 has no per-trade stop/target (user spec: daily limits only, via the risk
-        // governor above). To add one later: call SetStopLoss/SetProfitTarget right after each
-        // EnterLong/EnterShort call in TryEnterNative, tied to the same signal name. ATM mode
-        // gets its stop/target from the template instead (see AtmTemplateName).
+        // Native mode arms ATR brackets per entry (ArmBrackets) and manages them per tick
+        // (ManageTradeStops: breakeven + order-flow trailing). ATM mode gets its stop/target
+        // from the template instead (see AtmTemplateName).
         private void TryEnter(bool isBuy, long volume, DateTime marketTime)
         {
             if (_orderPending)
@@ -757,20 +781,168 @@ namespace NinjaTrader.NinjaScript.Strategies
             return false;
         }
 
-        // Stop floor from audit #2's volatility guard: stop >= 1.5x the 10-bar average range.
-        // Static StopLossTicks is the minimum; the floor only ever WIDENS it.
-        private int VolFlooredStopTicks()
+        // ── Trade management: ATR, brackets, breakeven, order-flow trailing ──
+        // Spec: docs/superpowers/specs/2026-07-29-bigprints-trade-management-design.md (main-project).
+
+        // Wilder ATR, identical formula to NinjaTrader's system ATR indicator (same hand-rolled
+        // pattern as FVGFlowStrategy.cs — see the field comment on _atrSeries for why). Seeds as
+        // a simple average of the first AtrPeriod true ranges, then smooths with k = 1/AtrPeriod.
+        private double ComputeAtr()
         {
-            int stopTicks = StopLossTicks > 0 ? StopLossTicks : 60;
-            if (CurrentBar >= 10)
+            double tr = TrueRange(0);
+
+            if (CurrentBar < AtrPeriod)
             {
-                double r10 = 0;
-                for (int i = 0; i < 10; i++) r10 += High[i] - Low[i];
-                r10 /= 10.0;
-                int volFloor = (int)Math.Ceiling(1.5 * r10 / TickSize);
-                if (volFloor > stopTicks) stopTicks = volFloor;
+                double sum = tr;
+                for (int k = 1; k < CurrentBar; k++)
+                    sum += TrueRange(k);
+                return sum / CurrentBar;
             }
-            return stopTicks;
+
+            double prevAtr = _atrSeries[1];
+            return prevAtr + (tr - prevAtr) / AtrPeriod;
+        }
+
+        private double TrueRange(int barsAgo)
+        {
+            double hl = High[barsAgo] - Low[barsAgo];
+            double hc = Math.Abs(High[barsAgo] - Close[barsAgo + 1]);
+            double lc = Math.Abs(Low[barsAgo] - Close[barsAgo + 1]);
+            return Math.Max(hl, Math.Max(hc, lc));
+        }
+
+        private void ResetTradeState()
+        {
+            _tradeEntryPrice = 0;
+            _tradeIsLong     = false;
+            _tradeMaxFav     = 0;
+            _tradeFloor      = 0;
+            _beArmed         = false;
+            _lastStopSent    = 0;
+        }
+
+        // Arms the initial ATR brackets for the next entry/reversal: stop = AtrStopMult x ATR
+        // (NO tick cap by design — Daily Loss Limit is the USD backstop), target = stop x
+        // RewardMultiple. Ticks mode here; the trail later switches the live stop to Price mode.
+        // Returns false (skip the signal) while ATR isn't warmed up yet.
+        private bool ArmBrackets()
+        {
+            double atr = CurrentBar >= 1 ? _atrSeries[0] : 0.0;
+            if (CurrentBar < AtrPeriod || atr <= 0)
+            {
+                Print(string.Format("[BigPrints] Signal skipped: ATR not ready (bar {0} < period {1}).", CurrentBar, AtrPeriod));
+                return false;
+            }
+
+            int stopT = Math.Max(1, (int)Math.Round(AtrStopMult * atr / TickSize));
+            int tgtT  = Math.Max(1, (int)Math.Round(stopT * RewardMultiple));
+            SetStopLoss("BigPrintLong",  CalculationMode.Ticks, stopT, false);
+            SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
+            SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
+            SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
+            _pendingStopTicks = stopT;
+            Print(string.Format("[BigPrints] Brackets armed: stop {0}t (={1:0.0} x ATR), target {2}t (={3:0.0}R)",
+                stopT, AtrStopMult, tgtT, RewardMultiple));
+            return true;
+        }
+
+        // Trail k from the aggression ledger — the "is it really turning?" sensor. Reuses the
+        // reversal filter's window and dominance ratio; no new detection machinery.
+        private double TrailK(bool isLong)
+        {
+            DateTime now = _lastTapeTime != DateTime.MinValue ? _lastTapeTime : Time[0];
+            long favor   = SumAggression(isLong, now);
+            long against = SumAggression(!isLong, now);
+
+            if (favor == 0 && against == 0)
+                return AtrStopMult;                       // no recent big prints — neutral
+            if (against >= ReversalDominanceRatio * favor)
+                return TrailTightMult;                    // opposing flow dominates — hug price
+            if (favor >= ReversalDominanceRatio * against)
+                return TrailWideMult;                     // favorable flow dominates — breathe
+            return AtrStopMult;
+        }
+
+        // Breakeven + chandelier trail, every tick while positioned (native mode only). The stop
+        // may RETREAT when flow turns favorable again (deliberate "breathing"), but never below
+        // the floor: initial stop price at first, raised to breakeven once BE arms — the worst
+        // case of the trade never worsens. The fixed profit target coexists: first touch wins.
+        private void ManageTradeStops()
+        {
+            if (IsAtmMode)
+                return;
+
+            MarketPosition pos = Position.MarketPosition;
+            if (pos == MarketPosition.Flat)
+            {
+                if (_tradeEntryPrice != 0)
+                    ResetTradeState();
+                return;
+            }
+
+            bool isLong = pos == MarketPosition.Long;
+
+            // Lazy init on the first tick of a new trade; a direction flip (one-order reversal)
+            // re-initializes too. _pendingStopTicks was set by ArmBrackets at submission.
+            if (_tradeEntryPrice == 0 || isLong != _tradeIsLong)
+            {
+                _tradeEntryPrice = Position.AveragePrice;
+                _tradeIsLong     = isLong;
+                _tradeMaxFav     = isLong ? High[0] : Low[0];
+                double stopDist  = _pendingStopTicks * TickSize;
+                _tradeFloor      = isLong ? _tradeEntryPrice - stopDist : _tradeEntryPrice + stopDist;
+                _beArmed         = false;
+                _lastStopSent    = 0;
+            }
+
+            _tradeMaxFav = isLong ? Math.Max(_tradeMaxFav, High[0]) : Math.Min(_tradeMaxFav, Low[0]);
+
+            // Breakeven: one-shot floor raise once max favorable excursion hits the trigger.
+            if (!_beArmed && BreakevenTriggerTicks > 0)
+            {
+                double favTicks = (isLong ? _tradeMaxFav - _tradeEntryPrice : _tradeEntryPrice - _tradeMaxFav) / TickSize;
+                if (favTicks >= BreakevenTriggerTicks)
+                {
+                    double be = isLong
+                        ? _tradeEntryPrice + BreakevenOffsetTicks * TickSize
+                        : _tradeEntryPrice - BreakevenOffsetTicks * TickSize;
+                    _tradeFloor = isLong ? Math.Max(_tradeFloor, be) : Math.Min(_tradeFloor, be);
+                    _beArmed = true;
+                    Print(string.Format("[BigPrints] Breakeven armed: floor -> {0}", _tradeFloor));
+                }
+            }
+
+            double desired;
+            if (TrailingEnabled)
+            {
+                double k   = TrailK(isLong);
+                double atr = _atrSeries[0];
+                if (atr <= 0)
+                    return;
+                desired = isLong ? _tradeMaxFav - k * atr : _tradeMaxFav + k * atr;
+                desired = isLong ? Math.Max(desired, _tradeFloor) : Math.Min(desired, _tradeFloor);
+            }
+            else if (_beArmed)
+            {
+                desired = _tradeFloor; // BE without trailing: park the stop at the floor
+            }
+            else
+            {
+                return; // static ATR stop from entry stands untouched
+            }
+
+            // A sell stop must rest below the market (and vice versa). If price has already
+            // overrun the desired level, do NOT chase it past the floor — leave the working
+            // stop alone; it is at/inside that level and about to trigger anyway.
+            desired = Instrument.MasterInstrument.RoundToTickSize(desired);
+            if (isLong ? desired > Close[0] - TickSize : desired < Close[0] + TickSize)
+                return;
+
+            if (_lastStopSent != 0 && Math.Abs(desired - _lastStopSent) < TickSize / 2)
+                return; // unchanged — don't spam order modifications
+            _lastStopSent = desired;
+
+            SetStopLoss(isLong ? "BigPrintLong" : "BigPrintShort", CalculationMode.Price, desired, false);
         }
 
         // NATIVE mode: EnterLong/EnterShort while in the opposite position reverses in one
@@ -797,14 +969,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (!PassesCooldown(isBuy, volume, now))
                     return; // consumed — not queued for later
+                if (!ArmBrackets())
+                    return; // ATR not warmed up yet
 
-                int stopT = VolFlooredStopTicks();
-                // ponytail: hardcoded 1.5R floor keeps the reward ratio when the vol floor widens the stop
-                int tgtT  = Math.Max(ProfitTargetTicks, (int)Math.Round(stopT * 1.5));
-                SetStopLoss("BigPrintLong",  CalculationMode.Ticks, stopT, false);
-                SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
-                SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
-                SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
                 if (isBuy) EnterLong(gov, "BigPrintLong");
                 else       EnterShort(gov, "BigPrintShort");
                 _orderPending = true;
@@ -814,14 +981,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (!PassesReversalFilter(true, isBuy, now))
                     return; // consumed — position rides, no reversal
+                if (!ArmBrackets())
+                    return;
 
-                int stopT = VolFlooredStopTicks();
-                // ponytail: hardcoded 1.5R floor keeps the reward ratio when the vol floor widens the stop
-                int tgtT  = Math.Max(ProfitTargetTicks, (int)Math.Round(stopT * 1.5));
-                SetStopLoss("BigPrintLong",  CalculationMode.Ticks, stopT, false);
-                SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
-                SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
-                SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
                 EnterShort(gov, "BigPrintShort");
                 _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: SELL x{0}", gov));
@@ -830,14 +992,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 if (!PassesReversalFilter(false, isBuy, now))
                     return;
+                if (!ArmBrackets())
+                    return;
 
-                int stopT = VolFlooredStopTicks();
-                // ponytail: hardcoded 1.5R floor keeps the reward ratio when the vol floor widens the stop
-                int tgtT  = Math.Max(ProfitTargetTicks, (int)Math.Round(stopT * 1.5));
-                SetStopLoss("BigPrintLong",  CalculationMode.Ticks, stopT, false);
-                SetStopLoss("BigPrintShort", CalculationMode.Ticks, stopT, false);
-                SetProfitTarget("BigPrintLong",  CalculationMode.Ticks, tgtT);
-                SetProfitTarget("BigPrintShort", CalculationMode.Ticks, tgtT);
                 EnterLong(gov, "BigPrintLong");
                 _orderPending = true;
                 Print(string.Format("[BigPrints] Native reversal submitted: BUY x{0}", gov));
@@ -936,7 +1093,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // is stale until this fires, and NT8's built-in duplicate-order guard does not cover
         // market orders — this is the gate that actually prevents double-submission.
         // NATIVE MODE ONLY — ATM-managed orders don't fire this callback (see PollAtmState instead).
-        // VERIFIED harmless with native brackets (StopLossTicks/ProfitTargetTicks) now in play:
+        // VERIFIED harmless with native brackets (the ATR stop/target) now in play:
         // this clears on ANY order for this strategy, not just the entry, so a bracket (Stop
         // loss/Profit target) fill re-fires this clear too — but _orderPending is already false
         // by then (cleared back when the ENTRY itself filled), so it's a false->false no-op. A
@@ -976,94 +1133,132 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if ((orderState == OrderState.Rejected || orderState == OrderState.Cancelled) &&
                 (order.Name == "BigPrintLong" || order.Name == "BigPrintShort" ||
-                 order.Name == "BigPrintRiskGovernor" || order.Name == "BigPrintSessionEnd"))
+                 order.Name == "BigPrintRiskGovernor" || order.Name == "BigPrintSessionEnd" ||
+                 order.Name == "BigPrintGovernor"))
                 _orderPending = false;
         }
 
         #region Properties
+        // GroupNames carry numeric prefixes because the NT8 property grid sorts groups alphabetically.
+
+        // ── 01. Signal ──────────────────────────────────────────────────────
         [NinjaScriptProperty]
         [Range(1, int.MaxValue)]
-        [Display(Name = "Min Volume", Description = "Minimum total contracts in a cluster to trade it.", Order = 1, GroupName = "Parameters")]
+        [Display(Name = "Min Volume", Description = "Minimum total contracts in a cluster to trade it.", Order = 1, GroupName = "01. Signal")]
         public int MinVolume { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, int.MaxValue)]
-        [Display(Name = "Cluster Milliseconds", Description = "Max gap between same-side prints to still count as one sweep.", Order = 2, GroupName = "Parameters")]
+        [Display(Name = "Cluster Milliseconds", Description = "Max gap between same-side prints to still count as one sweep.", Order = 2, GroupName = "01. Signal")]
         public int ClusterMilliseconds { get; set; }
 
         [NinjaScriptProperty]
-        [Range(1, 20)]
-        [Display(Name = "Contracts", Description = "Quantity per entry (and per reversal leg). Capped at 20 (fat-finger guard). NATIVE MODE ONLY — in ATM mode, size comes from the ATM template's own Quantity setting.", Order = 3, GroupName = "Parameters")]
-        public int Contracts { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 2359)]
-        [Display(Name = "Session Start (HHmm)", Description = "Entries allowed from this time, e.g. 930 for 09:30.", Order = 4, GroupName = "Parameters")]
-        public int SessionStart { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 2359)]
-        [Display(Name = "Session End (HHmm)", Description = "No new entries at/after this time; flattens any open position, e.g. 1555 for 15:55.", Order = 5, GroupName = "Parameters")]
-        public int SessionEnd { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, double.MaxValue)]
-        [Display(Name = "Daily Profit Target (USD)", Description = "Flatten and lock out entries for the rest of the day once hit. 0 = disabled.", Order = 6, GroupName = "Parameters")]
-        public double DailyProfitTargetUSD { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, double.MaxValue)]
-        [Display(Name = "Daily Loss Limit (USD)", Description = "Flatten and lock out entries for the rest of the day once hit. 0 = disabled.", Order = 7, GroupName = "Parameters")]
-        public double DailyLossLimitUSD { get; set; }
-
-        [NinjaScriptProperty]
-        [Display(Name = "ATM Template Name", Description = "Empty = native mode (managed EnterLong/EnterShort, no per-trade stop). Set to an ATM template name to route entries through that ATM — SL/TP are then managed by the template.", Order = 8, GroupName = "Parameters")]
-        public string AtmTemplateName { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 2000)]
-        [Display(Name = "Stop Loss (ticks)", Description = "NATIVE mode only, ignored in ATM mode. Static stop in ticks. Values <= 0 fall back to 60. The 1.5x 10-bar-range vol floor can only WIDEN it.", Order = 9, GroupName = "Parameters")]
-        public int StopLossTicks { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 2000)]
-        [Display(Name = "Profit Target (ticks)", Description = "NATIVE mode only, ignored in ATM mode. Profit target in ticks. Effective target is never below 1.5x the effective stop.", Order = 10, GroupName = "Parameters")]
-        public int ProfitTargetTicks { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 1000000)]
-        [Display(Name = "Trailing DD Remaining ($)", Description = "Trailing-drawdown headroom at strategy enable, from the prop dashboard. 0 = governor disabled. Native mode only — no effect when ATM Template Name is set.", Order = 1, GroupName = "Prop Governor")]
-        public double GovTrailingDDRemaining { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1, 100)]
-        [Display(Name = "Horizons Per Day", Description = "Expected trades/day for the per-trade risk split: risk = 2 x daily budget / sqrt(horizons).", Order = 2, GroupName = "Prop Governor")]
-        public int GovHorizonsPerDay { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(0, 20)]
-        [Display(Name = "Max Consecutive Losses", Description = "Session halt after this many consecutive losing trades. 0 = disabled.", Order = 3, GroupName = "Prop Governor")]
-        public int GovMaxConsecLosses { get; set; }
-
-        [NinjaScriptProperty]
-        [Range(1.0, 10.0)]
-        [Display(Name = "Vol Shock Mult", Description = "Half size when 10-bar avg range > mult x 50-bar avg range; zero size beyond 1.5x that.", Order = 4, GroupName = "Prop Governor")]
-        public double GovVolShockMult { get; set; }
-
-        [NinjaScriptProperty]
         [Range(10, 3600)]
-        [Display(Name = "Aggression Window (sec)", Description = "Lookback window for the reversal dominance filter — how far back to sum recent big-print volume by side.", Order = 11, GroupName = "Parameters")]
+        [Display(Name = "Aggression Window (sec)", Description = "Lookback window for the reversal dominance filter and the trailing-stop flow sensor — how far back to sum recent big-print volume by side.", Order = 3, GroupName = "01. Signal")]
         public int AggressionWindowSeconds { get; set; }
 
         [NinjaScriptProperty]
         [Range(1, 10)]
-        [Display(Name = "Reversal Dominance Ratio", Description = "A reversal only fires if the new side's windowed volume is at least this many times the held side's — filters a lone counter-signal out of a two-sided battle.", Order = 12, GroupName = "Parameters")]
+        [Display(Name = "Reversal Dominance Ratio", Description = "A reversal only fires if the new side's windowed volume is at least this many times the held side's. The trailing stop reuses this ratio to decide when one side's flow dominates.", Order = 4, GroupName = "01. Signal")]
         public double ReversalDominanceRatio { get; set; }
+
+        // ── 02. Trade Management (native mode only — ATM mode uses the template's SL/TP) ──
+        [NinjaScriptProperty]
+        [Range(1, 500)]
+        [Display(Name = "ATR Period", Description = "ATR lookback (bars of the chart series) for the dynamic stop and the trailing stop.", Order = 1, GroupName = "02. Trade Management")]
+        public int AtrPeriod { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.1, 10.0)]
+        [Display(Name = "ATR Stop Mult", Description = "Initial stop distance = this x ATR. No tick cap — on a violent day the stop is wide; the Daily Loss Limit is the USD backstop. Also the trail distance when tape flow is neutral.", Order = 2, GroupName = "02. Trade Management")]
+        public double AtrStopMult { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.1, 10.0)]
+        [Display(Name = "Reward Multiple", Description = "Profit target = effective stop x this (e.g. 1.5 = 1.5R).", Order = 3, GroupName = "02. Trade Management")]
+        public double RewardMultiple { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 2000)]
+        [Display(Name = "Breakeven Trigger (ticks)", Description = "Move the stop floor to breakeven once price moves this many ticks in favor. 0 = disabled.", Order = 4, GroupName = "02. Trade Management")]
+        public int BreakevenTriggerTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 100)]
+        [Display(Name = "Breakeven Offset (ticks)", Description = "Breakeven stop = entry +/- this many ticks (covers commissions so a scratch isn't a net loss).", Order = 5, GroupName = "02. Trade Management")]
+        public int BreakevenOffsetTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Trailing Enabled", Description = "Chandelier ATR trail modulated by tape flow: distance = k x ATR from the best price since entry, k breathing between Trail Tight/Wide Mult by aggression dominance. Never below the floor (initial stop, raised to BE).", Order = 6, GroupName = "02. Trade Management")]
+        public bool TrailingEnabled { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.1, 10.0)]
+        [Display(Name = "Trail Tight Mult", Description = "Trail k when OPPOSING windowed tape volume dominates (>= Reversal Dominance Ratio x favorable) — the stop hugs price.", Order = 7, GroupName = "02. Trade Management")]
+        public double TrailTightMult { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0.1, 10.0)]
+        [Display(Name = "Trail Wide Mult", Description = "Trail k when FAVORABLE windowed tape volume dominates — the stop breathes and lets the trade run.", Order = 8, GroupName = "02. Trade Management")]
+        public double TrailWideMult { get; set; }
 
         [NinjaScriptProperty]
         [Range(0, 240)]
-        [Display(Name = "Trade Cooldown (min)", Description = "Minimum rest after a trade closes before a NEW entry from flat is allowed. 0 = disabled. Does NOT block reversals.", Order = 13, GroupName = "Parameters")]
+        [Display(Name = "Trade Cooldown (min)", Description = "Minimum rest after a trade closes before a NEW entry from flat is allowed. 0 = disabled. Does NOT block reversals.", Order = 9, GroupName = "02. Trade Management")]
         public int CooldownMinutes { get; set; }
+
+        // ── 03. Money Management ────────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Range(1, 20)]
+        [Display(Name = "Contracts", Description = "Quantity per entry (and per reversal leg). Capped at 20 (fat-finger guard). NATIVE MODE ONLY — in ATM mode, size comes from the ATM template's own Quantity setting.", Order = 1, GroupName = "03. Money Management")]
+        public int Contracts { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Daily Profit Target (USD)", Description = "Flatten and lock out entries for the rest of the day once hit (includes open PnL). 0 = disabled.", Order = 2, GroupName = "03. Money Management")]
+        public double DailyProfitTargetUSD { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, double.MaxValue)]
+        [Display(Name = "Daily Loss Limit (USD)", Description = "Flatten and lock out entries for the rest of the day once hit (includes open PnL). 0 = disabled.", Order = 3, GroupName = "03. Money Management")]
+        public double DailyLossLimitUSD { get; set; }
+
+        // ── 04. Session ─────────────────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Range(0, 2359)]
+        [Display(Name = "Session Start (HHmm)", Description = "Entries allowed from this time, e.g. 930 for 09:30.", Order = 1, GroupName = "04. Session")]
+        public int SessionStart { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 2359)]
+        [Display(Name = "Session End (HHmm)", Description = "No new entries at/after this time; flattens any open position, e.g. 1555 for 15:55.", Order = 2, GroupName = "04. Session")]
+        public int SessionEnd { get; set; }
+
+        // ── 05. Prop Governor ───────────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Range(0, 1000000)]
+        [Display(Name = "Trailing DD Remaining ($)", Description = "Trailing-drawdown headroom at strategy enable, from the prop dashboard. 0 = governor disabled. Native mode only — no effect when ATM Template Name is set.", Order = 1, GroupName = "05. Prop Governor")]
+        public double GovTrailingDDRemaining { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 100)]
+        [Display(Name = "Horizons Per Day", Description = "Expected trades/day for the per-trade risk split: risk = 2 x daily budget / sqrt(horizons).", Order = 2, GroupName = "05. Prop Governor")]
+        public int GovHorizonsPerDay { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 20)]
+        [Display(Name = "Max Consecutive Losses", Description = "Session halt after this many consecutive losing trades. 0 = disabled.", Order = 3, GroupName = "05. Prop Governor")]
+        public int GovMaxConsecLosses { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1.0, 10.0)]
+        [Display(Name = "Vol Shock Mult", Description = "Half size when 10-bar avg range > mult x 50-bar avg range; zero size beyond 1.5x that.", Order = 4, GroupName = "05. Prop Governor")]
+        public double GovVolShockMult { get; set; }
+
+        // ── 06. ATM ─────────────────────────────────────────────────────────
+        [NinjaScriptProperty]
+        [Display(Name = "ATM Template Name", Description = "Empty = native mode (managed EnterLong/EnterShort with ATR brackets). Set to an ATM template name to route entries through that ATM — SL/TP are then managed by the template and ALL of 02. Trade Management is ignored.", Order = 1, GroupName = "06. ATM")]
+        public string AtmTemplateName { get; set; }
         #endregion
     }
 }
