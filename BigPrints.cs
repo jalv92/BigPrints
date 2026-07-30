@@ -185,6 +185,7 @@ namespace NinjaTrader.NinjaScript.Indicators
         private DateTime _analysisStartedUtc;
         private Grid   _analyzeGrid;
         private Button _analyzeButton;
+        private Button _recordButton;
         private DispatcherTimer _elapsedTimer;
 
         private const string DefaultBasePrompt =
@@ -264,11 +265,12 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                     _recorder = new BigPrintsRecorder(System.IO.Path.Combine(
                         NinjaTrader.Core.Globals.UserDataDir, "BigPrintsAI", "recordings"));
                     _recorder.Log = msg => Print(msg);
+                    _recorder.StateChanged = OnRecorderStateChanged;
                 }
             }
             else if (State == State.Historical)
             {
-                if (!EnableAiAdvisor || ChartControl == null)
+                if ((!EnableAiAdvisor && !EnableRecorder) || ChartControl == null)
                     return;
 
                 ChartControl.Dispatcher.InvokeAsync(new Action(() =>
@@ -283,19 +285,41 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                         VerticalAlignment   = VerticalAlignment.Bottom,
                         Margin              = new Thickness(0, 0, 12, 32),
                     };
-                    _analyzeButton = new Button
-                    {
-                        Content    = "Analyze",
-                        Padding    = new Thickness(10, 4, 10, 4),
-                        Foreground = Brushes.White,
-                        Background = Brushes.DarkSlateGray, // predefined brush — thread-safe, no Freeze needed
-                    };
-                    _analyzeButton.Click += OnAnalyzeClick;
-                    _analyzeGrid.Children.Add(_analyzeButton);
-                    UserControlCollection.Add(_analyzeGrid);
+                    var panel = new StackPanel { Orientation = Orientation.Horizontal };
 
-                    _elapsedTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-                    _elapsedTimer.Tick += OnElapsedTick;
+                    if (EnableRecorder)
+                    {
+                        _recordButton = new Button
+                        {
+                            Content    = "Record",
+                            Padding    = new Thickness(10, 4, 10, 4),
+                            Margin     = new Thickness(0, 0, 8, 0),
+                            Foreground = Brushes.White,
+                            Background = Brushes.DarkSlateGray,
+                            ToolTip    = "Arm ~1 min BEFORE the expected big print - pre-context starts at this click. Click again to cancel (armed) or finalize early (recording).",
+                        };
+                        _recordButton.Click += OnRecordClick;
+                        panel.Children.Add(_recordButton);
+                    }
+
+                    if (EnableAiAdvisor)
+                    {
+                        _analyzeButton = new Button
+                        {
+                            Content    = "Analyze",
+                            Padding    = new Thickness(10, 4, 10, 4),
+                            Foreground = Brushes.White,
+                            Background = Brushes.DarkSlateGray, // predefined brush — thread-safe, no Freeze needed
+                        };
+                        _analyzeButton.Click += OnAnalyzeClick;
+                        panel.Children.Add(_analyzeButton);
+
+                        _elapsedTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+                        _elapsedTimer.Tick += OnElapsedTick;
+                    }
+
+                    _analyzeGrid.Children.Add(panel);
+                    UserControlCollection.Add(_analyzeGrid);
                 }));
             }
             else if (State == State.Terminated)
@@ -328,6 +352,11 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                             _analyzeButton.Click -= OnAnalyzeClick;
                             _analyzeGrid?.Children.Remove(_analyzeButton);
                             _analyzeButton = null;
+                        }
+                        if (_recordButton != null)
+                        {
+                            _recordButton.Click -= OnRecordClick;
+                            _recordButton = null;
                         }
                         if (_analyzeGrid != null)
                         {
@@ -660,6 +689,38 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 RemoveDrawObject("BigPrintDot" + oldest);
                 RemoveDrawObject("BigPrintText" + oldest);
             }
+        }
+
+        // ---- Event Recorder UX --------------------------------------------------------
+
+        private void OnRecordClick(object sender, RoutedEventArgs e)
+        {
+            if (_recorder == null || State == State.Terminated)
+                return;
+            DateTime tapeNow;
+            lock (_deltaLock)
+                tapeNow = _lastTapeTime;
+            _recorder.Toggle(tapeNow);
+        }
+
+        // Called by the recorder under its own lock (from data/UI threads) — only queues
+        // a dispatcher delegate, never blocks, never calls back into the recorder.
+        private void OnRecorderStateChanged(BigPrintsRecorder.RecorderState state)
+        {
+            ChartControl?.Dispatcher.InvokeAsync(new Action(() =>
+            {
+                if (_recordButton == null)
+                    return;
+                switch (state)
+                {
+                    case BigPrintsRecorder.RecorderState.Armed:
+                        _recordButton.Content = "ARMED…"; _recordButton.Background = Brushes.DarkGoldenrod; break;
+                    case BigPrintsRecorder.RecorderState.Recording:
+                        _recordButton.Content = "REC…";   _recordButton.Background = Brushes.DarkRed;      break;
+                    default:
+                        _recordButton.Content = "Record";      _recordButton.Background = Brushes.DarkSlateGray; break;
+                }
+            }));
         }
 
         // ---- AI Advisor: click → capture → pipeline → render -------------------------
