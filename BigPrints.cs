@@ -556,8 +556,10 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
 
             // Recorder trigger — live path only; the Terminated/bestEffort path is handled
             // by OnTerminated() (bar/session serializers are unsafe on the teardown thread).
-            if (!bestEffort)
-                _recorder?.OnClusterTrigger(_clusterMaxTime, _clusterIsBuy, _clusterPrice,
+            // Gated on recorder state (not just non-null) so the bar/session serializers below
+            // aren't built and thrown away on every cluster while the recorder sits Off.
+            if (!bestEffort && _recorder != null && _recorder.State != BigPrintsRecorder.RecorderState.Off)
+                _recorder.OnClusterTrigger(_clusterMaxTime, _clusterIsBuy, _clusterPrice,
                     _clusterMaxPrint, _clusterVolume, _clusterPrintCount,
                     _clusterStartTime, _clusterLastTime,
                     Instrument.FullName, SerializeRecentBars(10), SerializeSessionStats());
