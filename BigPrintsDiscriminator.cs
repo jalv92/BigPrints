@@ -351,7 +351,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
             if ((t - o.TriggerTime).TotalSeconds > OutcomeCapSec)
-                ResolveOutcome(t, "UNRESOLVED", 0);
+            {
+                // Pre-corpus amendment (2026-07-30, Task-1 review): a move still making new
+                // extremes at the cap IS a continuation — UNRESOLVED here would drop the
+                // strongest continuations from the corpus scoreboard. UNRESOLVED remains only
+                // for the residual case (e.g. sparse tape where neither branch fired).
+                bool stillExtending = (t - o.ExtremeTime).TotalSeconds <= OutcomeWindowSec;
+                double bestAtCap = ext >= _tickSize / 2
+                    ? (o.IsBuySweep ? (o.Extreme - price) / ext : (price - o.Extreme) / ext)
+                    : 0;
+                ResolveOutcome(t, stillExtending ? "CONTINUATION" : "UNRESOLVED", bestAtCap);
+            }
         }
 
         private void ResolveOutcome(DateTime t, string label, double recovery)
