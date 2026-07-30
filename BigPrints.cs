@@ -92,6 +92,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         // as the gap between two reads is under that span — always true for a sub-10s cooldown.
         private int _lastSoundTick;
 
+        // ---- Event Recorder (spec 2026-07-30) ----------------------------------------
+        // Null unless EnableRecorder — every hook below is a no-op via `_recorder?.`.
+        private BigPrintsRecorder _recorder;
+        private int _clusterPrintCount;   // prints folded into the open cluster (recorder metadata)
+
         // ---- AI Advisor data-capture layer -------------------------------------------
         // L2 book maintained from OnMarketDepth, per NinjaTrader's own SampleLevel2Book:
         // lists indexed by e.Position (NOT price-keyed — a Remove at position 0 shifts
@@ -223,6 +228,7 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 BarsToSend           = 30;
                 AnalysisSoundFile    = "";
                 ShowFullAnalysis     = false;
+                EnableRecorder       = false;
             }
             else if (State == State.Configure)
             {
@@ -251,6 +257,13 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                             System.IO.File.WriteAllText(BasePromptFilePath, DefaultBasePrompt);
                     }
                     catch (Exception ex) { Print("BigPrints AI: could not seed base prompt file — " + ex.Message); }
+                }
+
+                if (EnableRecorder)
+                {
+                    _recorder = new BigPrintsRecorder(System.IO.Path.Combine(
+                        NinjaTrader.Core.Globals.UserDataDir, "BigPrintsAI", "recordings"));
+                    _recorder.Log = msg => Print(msg);
                 }
             }
             else if (State == State.Historical)
@@ -324,6 +337,8 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                     }));
                 }
 
+                _recorder?.OnTerminated();
+
                 // Flush whatever sweep was mid-cluster when the chart/session ended — otherwise
                 // the very last (often largest) print of the session never gets drawn.
                 FinalizeCluster(true);
@@ -332,7 +347,7 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
 
         protected override void OnMarketDepth(MarketDepthEventArgs e)
         {
-            if (!EnableAiAdvisor)
+            if (!EnableAiAdvisor && _recorder == null)
                 return;
 
             lock (e.Instrument.SyncMarketDepth)
@@ -354,6 +369,18 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 {
                     rows[e.Position].Price  = e.Price;
                     rows[e.Position].Volume = e.Volume;
+                }
+
+                // Recorder: sampled top-10 snapshot. Copy under the depth lock, at most
+                // once per 250ms (WantsBookSnapshot pre-check avoids copying otherwise).
+                if (_recorder != null && _recorder.WantsBookSnapshot(e.Time))
+                {
+                    int nb = Math.Min(10, _bidRows.Count), na = Math.Min(10, _askRows.Count);
+                    var bids = new double[nb][];
+                    var asks = new double[na][];
+                    for (int i = 0; i < nb; i++) bids[i] = new double[] { _bidRows[i].Price, _bidRows[i].Volume };
+                    for (int i = 0; i < na; i++) asks[i] = new double[] { _askRows[i].Price, _askRows[i].Volume };
+                    _recorder.OnBookSnapshot(e.Time, bids, asks);
                 }
             }
         }
@@ -422,11 +449,13 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             if (e.MarketDataType == MarketDataType.Bid)
             {
                 _bid = e.Price;
+                _recorder?.OnInside(e.Time, true, e.Price, e.Volume);
                 return;
             }
             if (e.MarketDataType == MarketDataType.Ask)
             {
                 _ask = e.Price;
+                _recorder?.OnInside(e.Time, false, e.Price, e.Volume);
                 return;
             }
             if (e.MarketDataType != MarketDataType.Last)
@@ -441,7 +470,13 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             else if (e.Price <= _bid)
                 isBuy = false;
             else
-                return; // print landed strictly between bid/ask — no clear aggressor, skip
+            {
+                // No clear aggressor for detection — but inside-spread prints are the
+                // iceberg evidence the recorder exists for, so record before skipping.
+                _recorder?.OnLast(e.Time, e.Price, e.Volume, 0, _bid, _ask);
+                return;
+            }
+            _recorder?.OnLast(e.Time, e.Price, e.Volume, isBuy ? 1 : -1, _bid, _ask);
 
             // AI Advisor session stats — same thread as all other Last-print handling.
             _cumDelta += isBuy ? e.Volume : -e.Volume;
@@ -468,6 +503,7 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             {
                 // Same side, within the sweep window and the hard wall-clock cap — fold into the cluster.
                 _clusterVolume  += e.Volume;
+                _clusterPrintCount++;
                 _clusterLastTime = e.Time;
                 if (e.Volume > _clusterMaxPrint)
                 {
@@ -484,6 +520,7 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             _clusterOpen      = true;
             _clusterIsBuy     = isBuy;
             _clusterVolume    = e.Volume;
+            _clusterPrintCount = 1;
             _clusterPrice     = e.Price;
             _clusterMaxPrint  = e.Volume;
             _clusterMaxTime   = e.Time;
@@ -516,6 +553,14 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 if (_recentClusters.Count > MaxClusterMemory)
                     _recentClusters.Dequeue();
             }
+
+            // Recorder trigger — live path only; the Terminated/bestEffort path is handled
+            // by OnTerminated() (bar/session serializers are unsafe on the teardown thread).
+            if (!bestEffort)
+                _recorder?.OnClusterTrigger(_clusterMaxTime, _clusterIsBuy, _clusterPrice,
+                    _clusterMaxPrint, _clusterVolume, _clusterPrintCount,
+                    _clusterStartTime, _clusterLastTime,
+                    Instrument.FullName, SerializeRecentBars(10), SerializeSessionStats());
 
             _tagCounter++;
             string dotTag  = "BigPrintDot"  + _tagCounter;
@@ -1053,6 +1098,10 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
         [NinjaScriptProperty]
         [Display(Name = "Show Full Analysis", Description = "Off (default): the panel shows only BUY/SHORT/HOLD with confidence. On: full rationale, levels and token usage on the panel. The JSONL log always keeps the full analysis either way.", Order = 30, GroupName = "AI Advisor")]
         public bool ShowFullAnalysis { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Recorder", Description = "Adds a Record button: arm it before an expected big print; the next cluster >= Min Volume is captured (tape + inside sizes + L2 snapshots, 120s post) to one JSON under BigPrintsAI/recordings. Playback tool.", Order = 40, GroupName = "Recorder")]
+        public bool EnableRecorder { get; set; }
         #endregion
     }
 }
