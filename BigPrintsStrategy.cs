@@ -176,7 +176,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         private double _tradeMaxFav;      // highest High (long) / lowest Low (short) since entry
         private double _tradeFloor;       // hard floor: initial stop price, raised to BE once armed
         private bool   _beArmed;
-        private double _lastStopSent;     // last price submitted via SetStopLoss(Price); 0 = none
+        private double _lastStopSent;     // CURRENT working stop price: floor at init, updated on each send, resynced by OnOrderUpdate on a failed change
+        private bool   _stopOrderFailed;  // stop-loss PLACEMENT rejected -> naked position; OnBarUpdate flattens and retries until flat
 
         protected override void OnStateChange()
         {
@@ -227,6 +228,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // so they can't be known here). Naturally a no-op in ATM mode: "BigPrintLong"/
                 // "BigPrintShort" are never used as entry signal names there (AtmStrategyCreate
                 // is used instead), so those brackets never have a matching entry to attach to.
+
+                // The trail modifies a live stop against a moving market; a modification that
+                // loses that race gets rejected, and the DEFAULT StopCancelClose handling then
+                // kills the WHOLE strategy (Playback 2026-07-29: "Stop price can't be changed
+                // below the market" -> "terminated itself"). Under accelerated Playback every
+                // price the strategy reads can be ticks stale, so no client-side buffer makes
+                // the race unlosable — instead, losing it must be benign: ignore + self-manage
+                // per the documented pattern. OnOrderUpdate flattens on a rejected stop
+                // PLACEMENT (naked position), resyncs the trail tracker on a failed CHANGE
+                // (the order keeps working at its old, still-valid price), and entry/flatten
+                // rejections were already handled/retried by the existing paths.
+                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
             }
             else if (State == State.DataLoaded)
             {
@@ -247,6 +260,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 _atrSeries        = new Series<double>(this);
                 _pendingStopTicks = 0;
+                _stopOrderFailed  = false;
                 ResetTradeState();
 
                 _atmStrategyId       = string.Empty;
@@ -295,6 +309,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             CheckRiskGovernor();
             CheckSessionEnd();
             ManageTradeStops();
+
+            // A rejected stop-loss PLACEMENT leaves the position naked (RealtimeErrorHandling
+            // is IgnoreAllErrors — nothing auto-closes anymore): flatten, retrying every tick
+            // until confirmed flat, mirroring the daily-lockout retry in CheckRiskGovernor.
+            if (_stopOrderFailed)
+            {
+                if (IsEffectivelyFlat())
+                    _stopOrderFailed = false;
+                else if (!_orderPending)
+                    FlattenNow("BigPrintStopFail");
+            }
 
             // Drain the signal queue LAST, after the governor/session checks above have had a
             // chance to update _dailyLockout/_orderPending on fresh state for this tick.
@@ -892,10 +917,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                 double stopDist  = _pendingStopTicks * TickSize;
                 _tradeFloor      = isLong ? _tradeEntryPrice - stopDist : _tradeEntryPrice + stopDist;
                 _beArmed         = false;
-                _lastStopSent    = 0;
+                // The floor IS the initial bracket's price — seeding the tracker with it makes
+                // the dedupe below swallow the trail's first update whenever it clamps to the
+                // floor. (Seeding 0 here submitted a same-price no-op modify at the start of
+                // every trade — the pointless change that lost the race on 2026-07-29.)
+                _lastStopSent    = Instrument.MasterInstrument.RoundToTickSize(_tradeFloor);
             }
 
             _tradeMaxFav = isLong ? Math.Max(_tradeMaxFav, High[0]) : Math.Min(_tradeMaxFav, Low[0]);
+
+            double bid = _bid, ask = _ask; // written by the tape thread; benign torn-free double reads
+            if (bid <= 0 || ask <= 0)
+                return;
+            // ponytail: fixed 4-tick buffer — raise or parameterize only if a live fast market
+            // still generates rejected modifies through it (they are non-fatal now, just noisy).
+            const int StopMarketBufferTicks = 4;
+            double buf = StopMarketBufferTicks * TickSize;
+
+            // Hands-off zone: the market is within the buffer of the CURRENT working stop —
+            // it is about to trigger, and any modification now is pointless and just races
+            // the engine. Leave it alone entirely (breakeven floor bookkeeping below included:
+            // a floor raised this close to the fill would be modified into the same race).
+            if (isLong ? bid - buf <= _lastStopSent : ask + buf >= _lastStopSent)
+                return;
 
             // Breakeven: one-shot floor raise once max favorable excursion hits the trigger.
             if (!_beArmed && BreakevenTriggerTicks > 0)
@@ -932,26 +976,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // A sell stop must rest below the BID, a buy stop above the ASK — validate against
-            // the live inside market, not Close[0] (the last trade can sit on the wrong side of
-            // the spread, e.g. a short's buy stop vs a last at the bid). Plus a safety buffer:
-            // the market keeps moving between this check and the modification landing, and a
-            // rejected stop-modify makes NT8's default error handling terminate the WHOLE
-            // strategy (seen in Playback 2026-07-29: "Stop price can't be changed below the
-            // market"). If the desired level is too close, leave the working stop alone this
-            // tick — it is about to trigger anyway, or next tick retries.
-            double bid = _bid, ask = _ask; // written by the tape thread; benign torn-free double reads
-            if (bid <= 0 || ask <= 0)
-                return;
+            // the live inside market, not Close[0] (the last trade can sit on the wrong side
+            // of the spread), with the same buffer. If the desired level is too close, leave
+            // the working stop alone this tick — next tick retries. A modify can still lose
+            // the race against a fast market despite this; that is non-fatal now (see
+            // RealtimeErrorHandling in Configure), OnOrderUpdate just resyncs the tracker.
             desired = Instrument.MasterInstrument.RoundToTickSize(desired);
-            // ponytail: fixed 4-tick buffer — enough for accelerated Playback jumps; make it a
-            // parameter only if a live fast market ever rejects a modify through it.
-            const int StopMarketBufferTicks = 4;
-            double closest = isLong ? bid - StopMarketBufferTicks * TickSize
-                                    : ask + StopMarketBufferTicks * TickSize;
-            if (isLong ? desired > closest : desired < closest)
+            if (isLong ? desired > bid - buf : desired < ask + buf)
                 return;
 
-            if (_lastStopSent != 0 && Math.Abs(desired - _lastStopSent) < TickSize / 2)
+            if (Math.Abs(desired - _lastStopSent) < TickSize / 2)
                 return; // unchanged — don't spam order modifications
             _lastStopSent = desired;
 
@@ -1144,10 +1178,38 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (IsAtmMode || order == null)
                 return;
 
+            // Self-managed error handling (RealtimeErrorHandling.IgnoreAllErrors — see
+            // Configure). "Stop loss"/"Profit target" are NT8's internal names for the
+            // SetStopLoss/SetProfitTarget bracket orders.
+            if (order.Name == "Stop loss")
+            {
+                if (orderState == OrderState.Rejected)
+                {
+                    // Placement rejected -> naked position. OnBarUpdate flattens and retries.
+                    _stopOrderFailed = true;
+                    Print("[BigPrints] Stop loss order REJECTED — flattening the naked position.");
+                }
+                else if (error != ErrorCode.NoError)
+                {
+                    // Failed CHANGE (e.g. the modify lost a race against a fast market): the
+                    // order keeps working at its previous, still-valid price — benign. Resync
+                    // the trail tracker to reality so later dedupes compare the right level.
+                    if (stopPrice > 0)
+                        _lastStopSent = stopPrice;
+                    Print(string.Format("[BigPrints] Stop change failed ({0}) — stop still working @ {1}.", error, stopPrice));
+                }
+                return;
+            }
+            if (order.Name == "Profit target" && orderState == OrderState.Rejected)
+            {
+                Print("[BigPrints] Profit target order REJECTED — the stop still protects; continuing without a target.");
+                return;
+            }
+
             if ((orderState == OrderState.Rejected || orderState == OrderState.Cancelled) &&
                 (order.Name == "BigPrintLong" || order.Name == "BigPrintShort" ||
                  order.Name == "BigPrintRiskGovernor" || order.Name == "BigPrintSessionEnd" ||
-                 order.Name == "BigPrintGovernor"))
+                 order.Name == "BigPrintGovernor" || order.Name == "BigPrintStopFail"))
                 _orderPending = false;
         }
 
