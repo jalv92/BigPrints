@@ -269,6 +269,33 @@ this file is the validation corpus. Check it with
 a discriminator is validated only at ≥22/30 correct on ≥30 admissible events (see the
 audit §4/§5 for admissibility and what n=2 cannot claim).
 
+**Amendments after the first Playback smoke test** (2026-07-30/31, see
+`docs/audits/2026-07-30-smoke-test-action-plan.md`) — the corpus count restarts at zero
+from here:
+
+- **Outcome label is a checkpoint, not a first crossing.** Recovery is evaluated once,
+  at the first print after the extension extreme has held 60 s. Evaluating on first
+  crossing labelled a 1-tick wiggle as a REVERSAL (every event resolved
+  `REVERSAL 1t/100%`) and also mislabelled a real continuation that transiently touched
+  58 % before fading to 40 %.
+- **T1's continuation threshold is 0.0007**, not the audit's 0.0008. The live engine
+  ranks the max print over up to 300 s of history where the offline study used 39-55 s,
+  and top_frac decays with window length; the one recorded continuation landed at
+  0.00079913. Documented re-pre-registration, not a tuning knob.
+- **`action` tells the truth in Immediate mode** (it used to hardcode
+  `immediate_entry` even when the entry was skipped).
+- Logs from before these fixes are void — archive them rather than scoring them.
+
+### Reading the run
+
+On enable the strategy prints `mode=… session=…-… discLog=…`; check that line before
+trusting anything else in a run. A skipped signal always prints its reason, and the
+corpus records it in `action` (`session`, `cooldown`, `lockout`, `gov_skip`,
+`reversal_filter`, …). Note that a contrarian fade taken while a position is already
+open must clear the reversal-dominance filter, which the trigger sweep itself just
+loaded against it — expect `reversal_filter` skips there rather than concluding the
+discriminators are silent.
+
 ## Disclaimer
 
 This software is provided for educational and research purposes. Trading futures involves substantial risk of loss. Nothing here is financial advice, the AI Advisor's output least of all. Test in Market Replay and on a simulated account before risking real money, and read the risk warning under [Strategy parameters](#parameters--strategy-bigprintsstrategycs).
