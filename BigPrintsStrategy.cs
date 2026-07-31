@@ -332,6 +332,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _signalIsBuy      = false;
                 _signalVolume     = 0;
                 _signalTime       = default(DateTime);
+                _lastImmediateAction = null;
                 _aggressionLedger.Clear();
                 _lastTapeTime     = DateTime.MinValue;
                 _lastFlatTime     = DateTime.MinValue; // no trade yet -> no cooldown
