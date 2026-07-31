@@ -44,6 +44,9 @@ def main(path):
                 if missing:
                     print("  FAIL line %d: outcome missing %s" % (i, sorted(missing)))
                     errors += 1
+                if r.get("label") not in ("REVERSAL", "CONTINUATION", "UNRESOLVED", "UNRESOLVED_SUPERSEDED"):
+                    print("  FAIL line %d: bad outcome label %r" % (i, r.get("label")))
+                    errors += 1
                 outcomes[r.get("trigger_ts")] = r
             else:
                 print("  FAIL line %d: unknown type %r" % (i, r.get("type")))

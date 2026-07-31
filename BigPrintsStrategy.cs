@@ -190,6 +190,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         private long     _signalVolume;
         private DateTime _signalTime;
 
+        // Truthful corpus action in Immediate mode (smoke-test action plan §2.4): what
+        // TryEnter actually returned for the most recent immediate attempt, so the JSONL
+        // "action" field matches the Discriminator path's vocabulary instead of hardcoding
+        // "immediate_entry". One-slot, same publish pattern as _signalQueued — string
+        // reference assignment is atomic, volatile for cross-thread visibility (strategy
+        // thread writes, market-data thread reads at eval time, per-trigger cadence).
+        private volatile string _lastImmediateAction;
+
         // ---- Discriminator entry (spec 2026-07-30) ----------------------------------
         // Engine exists whenever it has work (Discriminator mode OR logging); null
         // otherwise so every hook is a no-op via `_disc?.`. Fed ONLY from OnMarketData.
@@ -345,6 +353,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         Log = msg => Print(msg),
                     };
                 }
+                Print(string.Format("[BigPrints] mode={0} session={1:0000}-{2:0000} discLog={3}",
+                    EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog));
 
                 // Shared-governor: wipe this account's registry entry so a Playback rewind
                 // (which resets the account) starts clean; instances re-register on their next
@@ -451,7 +461,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // lockout/session) is still real tape flow for the reversal dominance filter.
                 RecordAggression(_signalIsBuy, _signalVolume, _signalTime);
                 if (EntryMode == BigPrintsEntryMode.Immediate)
-                    TryEnter(_signalIsBuy, _signalVolume, _signalTime);
+                {
+                    string result = TryEnter(_signalIsBuy, _signalVolume, _signalTime);
+                    _lastImmediateAction = result == "entered" ? (_signalIsBuy ? "long" : "short") : result;
+                }
                 // Discriminator mode: the cluster only feeds the ledger; entries come from
                 // the decision queue below once T1/T2/T3 have spoken.
             }
@@ -896,7 +909,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else if (EnableDiscriminatorLog)
                 {
                     DiscriminatorLog.AppendTrigger(ev, EntryMode.ToString(),
-                        EntryMode == BigPrintsEntryMode.Immediate ? "immediate_entry" : "no_trade");
+                        EntryMode == BigPrintsEntryMode.Immediate ? (_lastImmediateAction ?? "immediate_entry") : "no_trade");
                 }
             }
 
@@ -1035,7 +1048,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             if (!InSession(marketTime))
             {
-                Print("[BigPrints] Cluster not traded: outside the session window.");
+                Print(string.Format("[BigPrints] Cluster not traded: outside session window (t={0:00\\:00\\:00}, window {1:0000}-{2:0000}).",
+                    ToTime(marketTime), SessionStart, SessionEnd));
                 return "session";
             }
 

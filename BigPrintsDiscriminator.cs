@@ -30,7 +30,12 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ---- pre-registered 2026-07-30, audit §4 — do not tune ----------------------
         private const double T1TopFracReversal     = 0.0005; // max-print percentile <= 0.05%
-        private const double T1TopFracContinuation = 0.0008; // >= 0.08%
+        // Re-pre-registered 2026-07-30 (smoke-test action plan §3): 0.0008 -> 0.0007. The
+        // frozen value was derived on 39-55s of history vs the live engine's up-to-300s
+        // window, and top_frac decays with window length; live event C misses 0.0008 by
+        // 1.1%. Calibration on n=1 (C only), scored prospectively — T1's admissible corpus
+        // count restarts at zero (both on-disk records are void per §2.1).
+        private const double T1TopFracContinuation = 0.0007; // >= 0.07%
         private const double T1ThroughputSplit     = 15.0;   // contracts per ms
         private const int    T2TargetLevels        = 16;     // evaluate at 16th distinct level...
         private const int    T2MinLevels           = 8;      // ...abstain under 8
@@ -311,19 +316,23 @@ namespace NinjaTrader.NinjaScript.Strategies
             FinalizeT3AndVotes(p);
             p.DecisionTime = now;
             ClearPending();
-            Log(string.Format("[BigPrints/disc] {0} sweep {1} eval: T1={2}({3:0.0000}/{4:0.0}) T2={5}({6:0.00},{7} lvls) T3={8}({9}/{10}) -> {11}{12}",
+            Log(string.Format("[BigPrints/disc] {0} sweep {1} eval: T1={2}({3:0.000000}/{4:0.0}) T2={5}({6:0.00},{7} lvls) T3={8}({9}/{10}) -> {11}{12}",
                 p.IsBuySweep ? "BUY" : "SELL", p.Volume, p.T1, p.T1TopFrac, p.T1Throughput,
                 p.T2, p.T2Ratio, p.T2LevelsTraded, p.T3, p.T3D12, p.T3D25, p.Decision,
                 p.Decision == Verdict.Abstain ? "" : (p.EnterLong ? " -> LONG" : " -> SHORT")));
             return p;
         }
 
-        // Outcome label (audit §4, causal operationalization): the extension extreme is a
-        // running min (sell) / max (buy); every new extreme restarts the 60 s window. The
-        // "no print >= 8 ticks beyond the low" clause is subsumed: any such print IS a new
-        // extreme and restarts the window. REVERSAL resolves on >= 50 % recovery of
-        // (sweep_extreme - extension extreme) within the window; CONTINUATION when the
-        // window expires unrecovered; UNRESOLVED at t_end + 180 s.
+        // Outcome label (audit §4, causal operationalization — AMENDED 2026-07-30 post smoke
+        // test; prior labels void, corpus count restarts at zero): running extreme; every new
+        // extreme restarts the 60 s window. Recovery is evaluated ONCE, at the first print
+        // after the extreme has held OutcomeWindowSec — never on first crossing. A transient
+        // spike through 50 % that fades is a failed bounce, not a reversal (event C: 58.4 %
+        // max in-window, 39.8 % held -> CONTINUATION, matching audit §4's own numbers).
+        // The audit's "without printing >= 8 ticks below the low" invalidation clause is
+        // subsumed, strictly: ANY new tick below the low restarts our window, so a candidate
+        // the audit would void can never be called here in the first place. (On R and C this
+        // strictness changes nothing — verified by replay.)
         private void UpdateOutcome(DateTime t, double price)
         {
             Outcome o = _outcome;
@@ -335,36 +344,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             double ext = Math.Abs(o.SweepExtreme - o.Extreme);
-            if (ext >= _tickSize / 2)
-            {
-                double recovery = o.IsBuySweep
-                    ? (o.Extreme - price) / ext
-                    : (price - o.Extreme) / ext;
-                if (recovery >= OutcomeRecoveryFrac && (t - o.ExtremeTime).TotalSeconds <= OutcomeWindowSec)
-                {
-                    ResolveOutcome(t, "REVERSAL", recovery);
-                    return;
-                }
-            }
+
             if ((t - o.ExtremeTime).TotalSeconds > OutcomeWindowSec)
             {
-                double best = ext >= _tickSize / 2
-                    ? (o.IsBuySweep ? (o.Extreme - price) / ext : (price - o.Extreme) / ext)
-                    : 0;
-                ResolveOutcome(t, "CONTINUATION", best);
+                if (ext < _tickSize / 2) { ResolveOutcome(t, "UNRESOLVED", 0); return; } // 0/0: no extension low exists
+                double recovery = o.IsBuySweep ? (o.Extreme - price) / ext : (price - o.Extreme) / ext;
+                ResolveOutcome(t, recovery >= OutcomeRecoveryFrac ? "REVERSAL" : "CONTINUATION", recovery);
                 return;
             }
             if ((t - o.TriggerTime).TotalSeconds > OutcomeCapSec)
             {
-                // Pre-corpus amendment (2026-07-30, Task-1 review): a move still making new
-                // extremes at the cap IS a continuation — UNRESOLVED here would drop the
-                // strongest continuations from the corpus scoreboard. UNRESOLVED remains only
-                // for the residual case (e.g. sparse tape where neither branch fired).
-                bool stillExtending = (t - o.ExtremeTime).TotalSeconds <= OutcomeWindowSec;
-                double bestAtCap = ext >= _tickSize / 2
-                    ? (o.IsBuySweep ? (o.Extreme - price) / ext : (price - o.Extreme) / ext)
-                    : 0;
-                ResolveOutcome(t, stillExtending ? "CONTINUATION" : "UNRESOLVED", bestAtCap);
+                // Reachable only while the window is still open (the branch above returns
+                // otherwise) => an extreme was set after TriggerTime + (Cap - Window),
+                // so ext >= 1 tick here by construction; still extending => CONTINUATION.
+                double bestAtCap = o.IsBuySweep ? (o.Extreme - price) / ext : (price - o.Extreme) / ext;
+                ResolveOutcome(t, "CONTINUATION", bestAtCap);
             }
         }
 
