@@ -82,6 +82,10 @@ using NinjaTrader.NinjaScript;
 //   - No account-position adoption (StartBehavior.WaitUntilFlat) — a manually-opened position
 //     on this account is invisible to this strategy.
 //   - ConnectionLossHandling left at its NT8 default — no custom reconnect/flatten policy.
+//   - A stop-loss CHANGE that never gets an order event back (lost, not refused) is covered:
+//     the ManageTradeStops watchdog releases the in-flight gate after StopChangeWatchdogSec and
+//     forces exactly one resubmit past the price-dedupe (_forceStopResubmit) so a desynced
+//     tracker can't strand the breakeven park behind its own phantom "unchanged" reading.
 namespace NinjaTrader.NinjaScript.Strategies
 {
     public enum BigPrintsEntryMode { Immediate, Discriminator }
@@ -264,6 +268,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private volatile bool _stopChangePending;
         private DateTime      _stopChangeSentUtc; // WALL clock - same documented exception as _orderPendingSinceUtc: it measures order-event latency (a system property), not market time
         private volatile int  _stopChangeFails;   // consecutive refused/lost changes; back to 0 on any confirmed change. Drives the backoff and keeps a streak to ONE log line
+        // One-shot: set when the watchdog presumes a change LOST (no order event at all, not even
+        // a refusal). _lastStopSent was set optimistically to the target BEFORE that submit and
+        // was never resynced, so if the trail recomputes the exact same target the price dedupe
+        // in ManageTradeStops swallows every retry forever - worst case (TrailingEnabled=false,
+        // BE armed) the breakeven park never lands for the rest of the trade while the code
+        // believes it did.
+        // Bypasses ONLY the price dedupe, never the market-validation/hands-off checks above it;
+        // cleared at the point a resubmit actually reaches SetStopLoss.
+        private bool _forceStopResubmit;
         private const double  StopChangeWatchdogSec   = 5.0; // no order event at all in this long -> presume the change lost; the trail must never wait forever on an event that will not come
         // ponytail: 2,4,8,8,... seconds. Tuning knob, not a law - the first-failure line now logs
         // the submit->event latency, so size this from real numbers if a refusal ever persists.
@@ -1141,6 +1154,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             _stopChangePending = false;
             _stopChangeSentUtc = DateTime.MinValue;
             _stopChangeFails   = 0;
+            _forceStopResubmit = false;
         }
 
         // Records a refused or lost stop change: grows the wall-clock backoff (2, 4, 8s cap) and
@@ -1230,6 +1244,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_stopChangePending && (DateTime.UtcNow - _stopChangeSentUtc).TotalSeconds >= StopChangeWatchdogSec)
             {
                 _stopChangePending = false;
+                // _lastStopSent was set to the target BEFORE the lost submit and was never
+                // resynced (no event ever arrived to correct it) - force one resubmit past the
+                // dedupe below even if the recomputed target now equals that phantom value.
+                _forceStopResubmit = true;
                 NoteStopChangeFailure(string.Format("no order event in {0}s, change presumed lost", StopChangeWatchdogSec),
                     _lastStopSent, StopChangeWatchdogSec * 1000.0);
             }
@@ -1318,7 +1336,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (isLong ? desired > bid - buf : desired < ask + buf)
                 return;
 
-            if (Math.Abs(desired - _lastStopSent) < TickSize / 2)
+            // Dedupe: skip when the target hasn't moved - unless the watchdog above forced one
+            // resubmit (_forceStopResubmit) because a LOST change left _lastStopSent stuck at a
+            // phantom target that was never confirmed by any order event. Bypasses ONLY this
+            // check; the market-validation/hands-off gates above still apply untouched.
+            if (Math.Abs(desired - _lastStopSent) < TickSize / 2 && !_forceStopResubmit)
                 return; // unchanged — don't spam order modifications
 
             // ONE change in flight at a time, plus a time backoff after a refusal. NT8 refuses a
@@ -1340,6 +1362,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             _lastStopSent      = desired;
             _stopChangeSentUtc = DateTime.UtcNow;
             _stopChangePending = true;
+            _forceStopResubmit = false; // consumed — this resubmit is the one the watchdog forced (a no-op if it was already false)
 
             SetStopLoss(isLong ? "BigPrintLong" : "BigPrintShort", CalculationMode.Price, desired, false);
         }
@@ -1564,9 +1587,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
 
-                // Still travelling - not an outcome yet. Keep the gate closed so ManageTradeStops
-                // cannot fire a second change into it.
-                if (orderState == OrderState.ChangePending || orderState == OrderState.ChangeSubmitted)
+                // Still travelling with NO error - not an outcome yet. Keep the gate closed so
+                // ManageTradeStops cannot fire a second change into it. Gated on error == NoError:
+                // Playback can report the refusal itself as error != NoError on one of these
+                // NON-terminal states, and swallowing that here would hide the true
+                // error/orderState/latency behind a false "no order event" watchdog timeout later
+                // — exactly the instrumentation this fix exists to collect. An errored event on
+                // either state falls through to the failure branch below instead.
+                if ((orderState == OrderState.ChangePending || orderState == OrderState.ChangeSubmitted)
+                    && error == ErrorCode.NoError)
                     return;
 
                 // Any other state resolves whatever change was in flight. Open the gate FIRST and
