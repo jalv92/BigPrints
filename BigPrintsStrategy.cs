@@ -252,6 +252,23 @@ namespace NinjaTrader.NinjaScript.Strategies
         private DateTime _nextStopModifyUtc; // TIME backoff after a rejected CHANGE (a price-band veto froze a fixed breakeven park forever — audit 2026-07-29); wall clock, it measures system latency
         private bool   _stopOrderFailed;  // stop-loss PLACEMENT rejected -> naked position; OnBarUpdate flattens and retries until flat
 
+        // A stop CHANGE is in flight. NT8 refuses a second change while the previous one is still
+        // travelling (OrderState.ChangePending -> ChangeSubmitted) and reports
+        // ErrorCode.UnableToChangeOrder; the time-only damper above cannot see that, so under
+        // accelerated Playback (Calculate.OnEachTick) the trail raced itself and EVERY change of a
+        // whole trade was refused - Playback 2026-07-30: 18x "Stop change failed
+        // (UnableToChangeOrder) - stop still working @ 28476.5", the same price every time, i.e.
+        // the stop was frozen for the entire trade and BE/trail did nothing. ALWAYS set the flag
+        // BEFORE the SetStopLoss it guards, never after: under Playback the order event can fire
+        // re-entrantly INSIDE the order method, the same ordering rule as _orderPending above.
+        private volatile bool _stopChangePending;
+        private DateTime      _stopChangeSentUtc; // WALL clock - same documented exception as _orderPendingSinceUtc: it measures order-event latency (a system property), not market time
+        private volatile int  _stopChangeFails;   // consecutive refused/lost changes; back to 0 on any confirmed change. Drives the backoff and keeps a streak to ONE log line
+        private const double  StopChangeWatchdogSec   = 5.0; // no order event at all in this long -> presume the change lost; the trail must never wait forever on an event that will not come
+        // ponytail: 2,4,8,8,... seconds. Tuning knob, not a law - the first-failure line now logs
+        // the submit->event latency, so size this from real numbers if a refusal ever persists.
+        private const double  StopChangeBackoffCapSec = 8.0;
+
         protected override void OnStateChange()
         {
             if (State == State.SetDefaults)
@@ -1117,6 +1134,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             _beArmed           = false;
             _lastStopSent      = 0;
             _nextStopModifyUtc = DateTime.MinValue;
+            // No stop change can outlive the position it protected. Called from DataLoaded, from
+            // the flat branch of ManageTradeStops AND from its direction-flip branch: a one-order
+            // reversal never passes through flat (see TryEnterNative), so the flip is the ONLY
+            // reset a reversing trade ever gets.
+            _stopChangePending = false;
+            _stopChangeSentUtc = DateTime.MinValue;
+            _stopChangeFails   = 0;
+        }
+
+        // Records a refused or lost stop change: grows the wall-clock backoff (2, 4, 8s cap) and
+        // logs ONLY the first failure of a streak - 18 identical lines is not information. Wall
+        // clock per this file's rule: it measures order round-trip latency, a system property.
+        // Called from OnOrderUpdate (order thread) and from the watchdog in ManageTradeStops
+        // (strategy thread); the increment is not atomic, and losing that race only delays the
+        // next backoff step by one notch - the following failure re-counts.
+        private void NoteStopChangeFailure(string reason, double workingPrice, double latencyMs)
+        {
+            int fails          = _stopChangeFails + 1;
+            _stopChangeFails   = fails;
+            _nextStopModifyUtc = DateTime.UtcNow.AddSeconds(Math.Min(StopChangeBackoffCapSec, Math.Pow(2, Math.Min(fails, 3))));
+            if (fails == 1)
+                Print(string.Format("[BigPrints] Stop change failed ({0}) - stop still working @ {1}; latency {2:0}ms, backing off (repeats stay silent until one succeeds).",
+                    reason, workingPrice, latencyMs));
         }
 
         // Arms the initial ATR brackets for the entry/reversal about to be submitted: stop =
@@ -1181,12 +1221,29 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
+            // In-flight watchdog, deliberately ABOVE every other gate in this method: if the
+            // confirming order event never arrives, the escape must NOT depend on price moving far
+            // enough to clear the dedupe further down (a gate that only opens when the market
+            // cooperates is exactly how the 2026-07-29 price-band damper froze the trail). No
+            // return here on purpose - the max-favorable/breakeven bookkeeping below must keep
+            // running while a change is in flight; only the SUBMIT is gated, at the end.
+            if (_stopChangePending && (DateTime.UtcNow - _stopChangeSentUtc).TotalSeconds >= StopChangeWatchdogSec)
+            {
+                _stopChangePending = false;
+                NoteStopChangeFailure(string.Format("no order event in {0}s, change presumed lost", StopChangeWatchdogSec),
+                    _lastStopSent, StopChangeWatchdogSec * 1000.0);
+            }
+
             bool isLong = pos == MarketPosition.Long;
 
             // Lazy init on the first tick of a new trade; a direction flip (one-order reversal)
             // re-initializes too. _pendingStopTicks was set by ArmBrackets at submission.
             if (_tradeEntryPrice == 0 || isLong != _tradeIsLong)
             {
+                // Reset FIRST so every per-trade field dies with its trade - including the stop-
+                // change gate, backoff and streak. A one-order reversal never hits the flat branch
+                // above, so without this the new trade inherits the dead trade's damper.
+                ResetTradeState();
                 _tradeEntryPrice = Position.AveragePrice;
                 _tradeIsLong     = isLong;
                 _tradeMaxFav     = isLong ? High[0] : Low[0];
@@ -1264,15 +1321,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (Math.Abs(desired - _lastStopSent) < TickSize / 2)
                 return; // unchanged — don't spam order modifications
 
-            // Rejection damper: after a refused change, hold off further modifies briefly —
-            // re-attempting every tick only produces an error-spam loop ("Stop change failed
-            // ... stop still working" dozens of times, seen 2026-07-29). A TIME backoff, not a
-            // price band: a band permanently froze a fixed breakeven park after one transient
-            // rejection (audit 2026-07-29); time always self-heals.
-            if (DateTime.UtcNow < _nextStopModifyUtc)
+            // ONE change in flight at a time, plus a time backoff after a refusal. NT8 refuses a
+            // change while the previous one is still ChangePending/ChangeSubmitted (->
+            // ErrorCode.UnableToChangeOrder), and this strategy is Calculate.OnEachTick: under
+            // accelerated Playback OnBarUpdate fires far faster than a change round trip, so the
+            // time damper alone let the trail race itself into a refusal on every attempt while
+            // the resync in OnOrderUpdate handed it the same target back - 18 refusals, stop
+            // frozen for the whole trade (Playback 2026-07-30). The damper stays a TIME backoff,
+            // never a price band: a band permanently froze a fixed breakeven park after one
+            // transient rejection (audit 2026-07-29); time always self-heals. It is capped, so a
+            // persistent refusal costs at most one attempt per StopChangeBackoffCapSec and
+            // exactly one log line - no give-up state that could outlive the problem.
+            if (_stopChangePending || DateTime.UtcNow < _nextStopModifyUtc)
                 return;
 
-            _lastStopSent = desired;
+            // Tracker and flag BEFORE the submit - the order event can process first, re-entrantly
+            // inside SetStopLoss (see the ordering note on _orderPending). NOTHING below the call.
+            _lastStopSent      = desired;
+            _stopChangeSentUtc = DateTime.UtcNow;
+            _stopChangePending = true;
 
             SetStopLoss(isLong ? "BigPrintLong" : "BigPrintShort", CalculationMode.Price, desired, false);
         }
@@ -1484,28 +1551,66 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (orderState == OrderState.Rejected)
                 {
                     // Placement rejected -> naked position. OnBarUpdate flattens and retries.
-                    _stopOrderFailed = true;
-                    Print("[BigPrints] Stop loss order REJECTED — flattening the naked position.");
+                    // A refused CHANGE is not expected here (Playback reports it as error !=
+                    // NoError on a NON-terminal state, handled below), but that is an assumption,
+                    // not a documented guarantee - so log whether a change was in flight. If
+                    // changeInFlight=True ever appears, this branch is flattening a still-
+                    // protected position and needs splitting. Erring toward the flatten is
+                    // deliberate: an unprotected position is worse than a redundant flatten.
+                    bool wasChanging   = _stopChangePending;
+                    _stopChangePending = false;
+                    _stopOrderFailed   = true;
+                    Print(string.Format("[BigPrints] Stop loss order REJECTED (changeInFlight={0}) - flattening the naked position.", wasChanging));
+                    return;
                 }
-                else if (error != ErrorCode.NoError)
+
+                // Still travelling - not an outcome yet. Keep the gate closed so ManageTradeStops
+                // cannot fire a second change into it.
+                if (orderState == OrderState.ChangePending || orderState == OrderState.ChangeSubmitted)
+                    return;
+
+                // Any other state resolves whatever change was in flight. Open the gate FIRST and
+                // unconditionally: a stale or duplicate event may only ever UNSTICK it, never
+                // leave it stuck (the watchdog in ManageTradeStops is the last resort).
+                double latencyMs   = _stopChangeSentUtc == DateTime.MinValue
+                    ? -1.0 : (DateTime.UtcNow - _stopChangeSentUtc).TotalMilliseconds;
+                _stopChangePending = false;
+
+                // Side gate (audit 2026-07-29): an event belonging to the PREVIOUS trade can land
+                // after a reversal re-seeded the tracker - its OrderAction won't match the current
+                // position's protective side, and accepting its price would freeze the trail
+                // behind the hands-off check.
+                bool matchesSide = Position.MarketPosition == MarketPosition.Long
+                    ? order.OrderAction == OrderAction.Sell
+                    : Position.MarketPosition == MarketPosition.Short && order.OrderAction == OrderAction.BuyToCover;
+
+                if (error != ErrorCode.NoError)
                 {
-                    // Failed CHANGE (e.g. the modify lost a race against a fast market): the
-                    // order keeps working at its previous, still-valid price — benign. Resync
-                    // the trail tracker to reality so later dedupes compare the right level.
-                    // Side gate (audit 2026-07-29): a DELAYED rejection belonging to the
-                    // previous trade can land after a reversal re-seeded the tracker — its
-                    // OrderAction won't match the current position's protective side, and
-                    // accepting it would freeze the trail behind the hands-off check.
-                    // Back off further modifies for 2s wall regardless of which trade the
-                    // rejection belonged to — worst case a new trade's first trail update is
-                    // delayed 2s; the resync below stays side-gated.
-                    _nextStopModifyUtc = DateTime.UtcNow.AddSeconds(2);
-                    bool matchesSide = Position.MarketPosition == MarketPosition.Long
-                        ? order.OrderAction == OrderAction.Sell
-                        : Position.MarketPosition == MarketPosition.Short && order.OrderAction == OrderAction.BuyToCover;
+                    // Failed CHANGE (refused, or it lost the race against a fast market): the
+                    // order keeps working at its previous, still-valid price - benign. Resync the
+                    // tracker to reality so later dedupes compare the right level, then back off
+                    // instead of retrying blind. The reason carries orderState + the submit->event
+                    // latency: that is what identifies WHICH refusal this is, next run.
                     if (matchesSide && stopPrice > 0)
                         _lastStopSent = stopPrice; // resync to the order's real working price
-                    Print(string.Format("[BigPrints] Stop change failed ({0}) — stop still working @ {1}.", error, stopPrice));
+                    NoteStopChangeFailure(string.Format("{0}/{1}{2}", error, orderState, matchesSide ? "" : "/OTHER-SIDE"),
+                        stopPrice, latencyMs);
+                    return;
+                }
+
+                // Confirmed change (or the initial placement): reality wins and the failure streak
+                // dies, so one transient refusal can never cost more than one delayed update. This
+                // is also the first time this strategy CONFIRMS a stop change instead of assuming
+                // it landed. The pending backoff is deliberately NOT cancelled here: it expires on
+                // its own within StopChangeBackoffCapSec, and cancelling it would let a stray
+                // NoError event on the same order re-open the per-tick retry loop this fix exists
+                // to kill.
+                if (matchesSide && stopPrice > 0)
+                {
+                    if (_stopChangeFails > 0)
+                        Print(string.Format("[BigPrints] Stop change recovered after {0} failure(s) - working @ {1}.", _stopChangeFails, stopPrice));
+                    _stopChangeFails = 0;
+                    _lastStopSent    = stopPrice;
                 }
                 return;
             }
