@@ -206,6 +206,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Engine exists whenever it has work (Discriminator mode OR logging); null
         // otherwise so every hook is a no-op via `_disc?.`. Fed ONLY from OnMarketData.
         private BigPrintsDiscriminator _disc;
+
+        // ---- Setup library, phase 1 (spec 2026-08-01): caso-4 detector, LOG-ONLY ------
+        // Never trades; fed only from OnMarketData, same threading model as _disc.
+        private FailedRetestLongDetector _frl;
         private long   _clusterMaxPrint;   // largest single print in the open cluster
         private int    _clusterPrintCount;
         private double _clusterExtreme;    // lowest price in a sell cluster / highest in a buy
@@ -389,8 +393,15 @@ namespace NinjaTrader.NinjaScript.Strategies
                             + " they measure a different print-size/delta scale. Logging still works; "
                             + "score the corpus per instrument.");
                 }
-                Print(string.Format("[BigPrints] disc=v3/NQ mode={0} session={1:0000}-{2:0000} discLog={3}",
-                    EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog));
+                if (EnableFailedRetestLog)
+                {
+                    _frl = new FailedRetestLongDetector(TickSize, Instrument.FullName)
+                    {
+                        Log = msg => Print(msg),
+                    };
+                }
+                Print(string.Format("[BigPrints] disc=v3/NQ mode={0} session={1:0000}-{2:0000} discLog={3} frlLog={4}",
+                    EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog, EnableFailedRetestLog));
 
                 // Shared-governor: wipe this account's registry entry so a Playback rewind
                 // (which resets the account) starts clean; instances re-register on their next
@@ -416,6 +427,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (IsAtmMode && Account != null && Account.Name.StartsWith("Playback"))
                     Print("[BigPrints] WARNING: ATM mode on a Playback account — NT8 does not support ATM-from-NinjaScript in Playback. Prefer native mode (ATR brackets) here.");
             }
+            // ponytail: no Terminated branch for _frl — OnStateChange runs on a different
+            // thread than OnMarketData (review finding); an in-flight setup track at
+            // teardown becomes a visible orphan signal in the JSONL, not a silent loss.
         }
 
         // Risk/session governor — runs every tick (Calculate.OnEachTick fires OnBarUpdate on each
@@ -931,6 +945,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         DiscriminatorLog.AppendTrigger(ab, EntryMode.ToString(), "daily_reset");
                     _disc.Reset();
                 }
+                _frl?.Reset(); // session boundary: a leg low must not carry across days
             }
 
             // Freshest tape time, for every event type — used by PollAtmState to timestamp an
@@ -991,6 +1006,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return; // print landed strictly between bid/ask — no clear aggressor, skip
 
             _disc?.OnPrint(e.Time, e.Price, e.Volume, isBuy);
+            _frl?.OnPrint(e.Time, e.Price, e.Volume, isBuy);
 
             if (_clusterOpen &&
                 isBuy == _clusterIsBuy &&
@@ -1807,6 +1823,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Enable Discriminator Log", Description = "Log every cluster >= Min Volume with its T1/T2/T3 values, votes, action and eventual outcome label to BigPrintsAI/discriminator_log.jsonl — in BOTH entry modes. This is the validation corpus; leave it on.", Order = 2, GroupName = "07. Discriminator Entry")]
         public bool EnableDiscriminatorLog { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Enable Failed-Retest Log", Description = "Setup library, LOG-ONLY (never trades): detects the 'failed no-touch retest of the leg low' long setup (caso 4, audit 2026-08-01) and logs signals + 600s MFE/MAE outcomes to BigPrintsAI/setup_log.jsonl. Thresholds frozen, n=1-calibrated — the corpus decides if it ever earns a Trade switch.", Order = 3, GroupName = "07. Discriminator Entry")]
+        public bool EnableFailedRetestLog { get; set; }
         #endregion
     }
 }

@@ -94,6 +94,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             public double  UniMaxFrac;
             public int     UniPeers;
             public bool    UniOk;
+            // Free logged covariates (2026-08-01 day-28 mining; no decision reads them)
+            public double  An60;               // flow agreement: (d60 x side)/v60, 0 when v60=0
+            public double  SState;             // rolling reversal-rate of last 10 resolved outcomes; -1 while n<10
+            public int     SN;                 // resolved outcomes behind SState
             // legacy metrics, logged-only on NQ
             public double  T1TopFrac, T1Throughput;
             public Verdict T1;
@@ -123,13 +127,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         // arrives. Context computations use bars with Sec strictly BEFORE the second of
         // the cluster's first print — the anti-leak rule from the 2026-08-01 scan
         // (t_start and t_end can share a second; that second's bar must not count).
-        private class SecBar { public long Sec; public double High = double.MinValue, Low = double.MaxValue; public long Delta; }
+        private class SecBar { public long Sec; public double High = double.MinValue, Low = double.MaxValue; public long Delta, Vol; }
         private readonly Queue<SecBar> _bars = new Queue<SecBar>();
         private SecBar _openBar;
         // Open-second state BEFORE the most recent print — snapshotted at cluster open so
         // B1 can see whether any pre-cluster print in the same second already broke the level.
         private double _preLowBeforeLastPrint  = double.MaxValue;
         private double _preHighBeforeLastPrint = double.MinValue;
+        // Last print fed in — an60's anti-leak subtraction: on the opposite-side finalize
+        // path the NEW print enters the bars BEFORE OnClusterFinalized runs, so a print
+        // stamped after t_end must be backed out of the trailing sums (review finding).
+        private DateTime _lastPrintT;
+        private long _lastPrintDelta, _lastPrintVol;
         private double _clusterPreLow  = double.MaxValue;
         private double _clusterPreHigh = double.MinValue;
 
@@ -158,6 +167,13 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
         private Outcome _outcome;
 
+        // S(t) day-state: rolling window of excursion labels from RESOLVED outcomes only
+        // (rev=1 when the excursion AGAINST the sweep side beat the one WITH it). Free —
+        // built from data the outcome tracker already produces. Logged, never decides.
+        private readonly Queue<int> _revs = new Queue<int>();
+        private int _revSum;
+        private const int SStateWindow = 10;
+
         private DateTime _lastSeen = DateTime.MinValue;
 
         public void Reset()
@@ -173,6 +189,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             ClearPending();
             _completed = null;
             _outcome  = null;
+            _revs.Clear(); _revSum = 0;
             _lastSeen = DateTime.MinValue;
         }
 
@@ -239,6 +256,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (price > _openBar.High) _openBar.High = price;
             if (price < _openBar.Low)  _openBar.Low  = price;
             _openBar.Delta += isBuy ? size : -size;
+            _openBar.Vol   += size;
+            _lastPrintT     = t;
+            _lastPrintDelta = isBuy ? size : -size;
+            _lastPrintVol   = size;
 
             if (_pending != null)
                 AccumulatePending(t, price, size, isBuy);
@@ -349,6 +370,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             };
             ComputeT1AndUni(p);
             ComputeContext(p);
+            ComputeAn60(p);
+            p.SState = _revs.Count >= SStateWindow ? (double)_revSum / _revs.Count : -1;
+            p.SN     = _revs.Count;
             _pending = p;
             // Only BalanceSweep decides at t_end+0ms (the case-3 entry was AT t_end; a 5s
             // wait is pure cost there). None/Virgin hold the 5s window so T2/T3 covariates
@@ -392,6 +416,31 @@ namespace NinjaTrader.NinjaScript.Strategies
             p.UniMaxFrac = p.Volume > 0 ? (double)p.MaxPrint / p.Volume : 1.0;
             p.UniPeers   = k;
             p.UniOk      = historyOk && p.UniMaxFrac <= UniMaxPrintFrac && k >= UniMinPeers;
+        }
+
+        // an60 covariate: trailing-60s flow agreement at t_end, cluster's own prints
+        // INCLUDED (open bar counts) per the mining definition. Logged only.
+        private void ComputeAn60(Evaluation p)
+        {
+            long cutoff = SecOf(p.TriggerTime) - 60;
+            long d = 0, v = 0;
+            foreach (SecBar b in _bars)
+            {
+                if (b.Sec <= cutoff) continue;
+                d += b.Delta; v += b.Vol;
+            }
+            if (_openBar != null && _openBar.Sec > cutoff)
+            {
+                d += _openBar.Delta; v += _openBar.Vol;
+            }
+            // Anti-leak: the opposite-side finalize path processes the NEW print before
+            // this runs — back it out when it is stamped after t_end. At most one such
+            // print can have entered (finalization happens inside that same event).
+            if (_lastPrintT > p.TriggerTime)
+            {
+                d -= _lastPrintDelta; v -= _lastPrintVol;
+            }
+            p.An60 = v > 0 ? (double)((p.IsBuySweep ? d : -d)) / v : 0;
         }
 
         // Context from closed 1s bars strictly before the cluster's first-print second.
@@ -595,6 +644,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             Outcome o = _outcome;
             _outcome = null;
+            // Feed S(t): real resolutions only (superseded partials go via CloseOutcome).
+            int rev = (o.IsBuySweep ? o.MaxDn > o.MaxUp : o.MaxUp > o.MaxDn) ? 1 : 0;
+            _revs.Enqueue(rev); _revSum += rev;
+            if (_revs.Count > SStateWindow) _revSum -= _revs.Dequeue();
             double extTicks = Math.Abs(o.SweepExtreme - o.Extreme) / _tickSize;
             Log(string.Format("[BigPrints/disc] outcome {0}: extension {1:0}t, recovery {2:0}%",
                 label, extTicks, recovery * 100));
@@ -667,6 +720,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     ["k_only"] = e.KOnly,
                 },
                 ["uni"] = new JObject { ["max_frac"] = e.UniMaxFrac, ["peers"] = e.UniPeers, ["ok"] = e.UniOk },
+                ["an60"] = e.An60,
+                ["s_state"] = e.SState,
+                ["s_n"] = e.SN,
                 ["t1"] = new JObject { ["top_frac"] = e.T1TopFrac, ["throughput"] = e.T1Throughput, ["verdict"] = e.T1.ToString() },
                 ["t2"] = new JObject { ["ratio"] = e.T2Ratio, ["levels_traded"] = e.T2LevelsTraded, ["verdict"] = e.T2.ToString() },
                 ["t3"] = new JObject { ["d12"] = e.T3D12, ["d25"] = e.T3D25, ["verdict"] = e.T3.ToString() },
