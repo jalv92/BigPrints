@@ -24,10 +24,19 @@ using Newtonsoft.Json.Linq;
 // under a static lock (DiscriminatorLog precedent).
 namespace NinjaTrader.NinjaScript.Strategies
 {
+    // Per-setup switch (public: used by a [NinjaScriptProperty] on the strategy).
+    // Off = detector disabled. LogOnly = detect + log, never trade. Trade = also enter
+    // via the strategy's standard entry path — Playback evaluation; n=1, not live-validated.
+    public enum BigPrintsSetupMode { Off, LogOnly, Trade }
+
     internal class FailedRetestLongDetector
     {
         public Action<string> Log = delegate { };
         public bool LoggingEnabled = true;
+        // Fired at signal time on the market-data thread: (time, entry, stop, trigVol).
+        // The strategy publishes it into its own one-slot volatile queue and trades it
+        // from the strategy thread — this class itself never touches orders.
+        public Action<DateTime, double, double, long> OnSignal = delegate { };
 
         // ---- frozen 2026-08-01 (n=1-calibrated; logged, do not tune) -----------------
         private const double RallyMinPts      = 25.0;  // arm: rally off L0
@@ -214,6 +223,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 SetupLog.AppendSignal(_lastBarTime, _instrument, entry, stop, _l0, _l1,
                     gap / _tickSize, (_l1Time - _l0Time).TotalSeconds, _bandDelta, _nearLowBuyVol,
                     _barDelta, _barVol, _barVol / Math.Max(meanVol, 1));
+            OnSignal(_lastBarTime, entry, stop, _barVol);
         }
 
         private void UpdateTrack(DateTime t, double price)
@@ -288,6 +298,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ["trig_delta"] = trigDelta,
                 ["trig_vol"] = trigVol,
                 ["trig_vol_mult"] = trigVolMult,
+            });
+        }
+
+        public static void AppendAction(DateTime signalTs, string instrument, string action)
+        {
+            Append(new JObject
+            {
+                ["type"] = "signal_action",
+                ["setup"] = "failed_retest_long",
+                ["v"] = 1,
+                ["signal_ts"] = signalTs.ToString("o"),
+                ["instrument"] = instrument,
+                ["action"] = action, // "entered" or the TryEnter rejection reason; LogOnly never writes this
             });
         }
 

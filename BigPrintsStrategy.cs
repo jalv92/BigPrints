@@ -207,9 +207,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         // otherwise so every hook is a no-op via `_disc?.`. Fed ONLY from OnMarketData.
         private BigPrintsDiscriminator _disc;
 
-        // ---- Setup library, phase 1 (spec 2026-08-01): caso-4 detector, LOG-ONLY ------
-        // Never trades; fed only from OnMarketData, same threading model as _disc.
+        // ---- Setup library, phase 1 (spec 2026-08-01): caso-4 detector ----------------
+        // Fed only from OnMarketData, same threading model as _disc. In Trade mode its
+        // signals route through the SAME TryEnter path as discriminator decisions (all
+        // gates + ATR brackets + trail/BE machinery; no new order code) via the one-slot
+        // volatile queue below — same payload-before-flag pattern as _decisionQueued.
         private FailedRetestLongDetector _frl;
+        private class FrlSignal { public DateTime Time; public long Volume; }
+        private volatile bool _frlSignalQueued;
+        private FrlSignal _frlSignal;
         private long   _clusterMaxPrint;   // largest single print in the open cluster
         private int    _clusterPrintCount;
         private double _clusterExtreme;    // lowest price in a sell cluster / highest in a buy
@@ -327,6 +333,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 CooldownMinutes         = 5;
                 EntryMode               = BigPrintsEntryMode.Immediate;
                 EnableDiscriminatorLog  = true;
+                FailedRetestMode        = BigPrintsSetupMode.LogOnly;
             }
             else if (State == State.Configure)
             {
@@ -393,15 +400,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                             + " they measure a different print-size/delta scale. Logging still works; "
                             + "score the corpus per instrument.");
                 }
-                if (EnableFailedRetestLog)
+                _frlSignalQueued = false;
+                _frlSignal = null;
+                if (FailedRetestMode != BigPrintsSetupMode.Off)
                 {
                     _frl = new FailedRetestLongDetector(TickSize, Instrument.FullName)
                     {
                         Log = msg => Print(msg),
                     };
+                    _frl.OnSignal = (t, entry, stop, vol) =>
+                    {
+                        _frlSignal = new FrlSignal { Time = t, Volume = vol }; // payload before flag
+                        _frlSignalQueued = true;
+                    };
                 }
-                Print(string.Format("[BigPrints] disc=v3/NQ mode={0} session={1:0000}-{2:0000} discLog={3} frlLog={4}",
-                    EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog, EnableFailedRetestLog));
+                Print(string.Format("[BigPrints] disc=v3/NQ mode={0} session={1:0000}-{2:0000} discLog={3} frl={4}",
+                    EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog, FailedRetestMode));
 
                 // Shared-governor: wipe this account's registry entry so a Playback rewind
                 // (which resets the account) starts clean; instances re-register on their next
@@ -530,6 +544,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                     if (EnableDiscriminatorLog)
                         DiscriminatorLog.AppendTrigger(dec, EntryMode.ToString(),
                             result == "entered" ? (dec.EnterLong ? "long" : "short") : result);
+                }
+            }
+
+            // Caso-4 setup signals: Trade mode routes through the SAME entry path and gates
+            // as discriminator decisions (ATR brackets + trail/BE manage the exit; the
+            // setup's structural stop stays in the corpus log for offline scoring).
+            if (_frlSignalQueued)
+            {
+                _frlSignalQueued = false;
+                FrlSignal sig = _frlSignal;
+                _frlSignal = null;
+                if (sig != null && FailedRetestMode == BigPrintsSetupMode.Trade)
+                {
+                    string result = TryEnter(true, sig.Volume, sig.Time);
+                    Print("[BigPrints/frl] Trade-mode signal -> " + result);
+                    SetupLog.AppendAction(sig.Time, Instrument.FullName, result);
                 }
             }
         }
@@ -1825,8 +1855,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         public bool EnableDiscriminatorLog { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Enable Failed-Retest Log", Description = "Setup library, LOG-ONLY (never trades): detects the 'failed no-touch retest of the leg low' long setup (caso 4, audit 2026-08-01) and logs signals + 600s MFE/MAE outcomes to BigPrintsAI/setup_log.jsonl. Thresholds frozen, n=1-calibrated — the corpus decides if it ever earns a Trade switch.", Order = 3, GroupName = "07. Discriminator Entry")]
-        public bool EnableFailedRetestLog { get; set; }
+        [Display(Name = "Failed-Retest Setup Mode", Description = "Caso 4: 'failed no-touch retest of the leg low' long setup (audit 2026-08-01). LogOnly (default) = detect + log signals and 600s MFE/MAE outcomes to BigPrintsAI/setup_log.jsonl, never trade. Trade = ALSO enter long via the standard entry path (all gates + ATR brackets + trailing; the setup's structural stop stays in the log for scoring) — meant for Playback evaluation; thresholds are n=1-calibrated and NOT validated for live money. Off = detector disabled.", Order = 3, GroupName = "07. Discriminator Entry")]
+        public BigPrintsSetupMode FailedRetestMode { get; set; }
         #endregion
     }
 }
