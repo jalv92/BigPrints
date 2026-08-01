@@ -42,7 +42,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const int    K2GapBreakSec       = 2;     // a >2s bar gap breaks an episode run
         private const long   K3MaxAbsDelta       = 250;   // contracts (NQ)
         private const double B2MinBreakPts       = 6.0;   // sweep must carry through the level
-        private const double VirginMinPts        = 12.0;  // depth past the window extreme
+        // Re-pre-registered 2026-08-01 (Javier's call, same precedent as T1 0.0008->0.0007):
+        // 12.0 -> 10.0. Measurement-transfer correction, not outcome tuning: the 12.0 was
+        // calibrated on the audit's FULL-SWEEP virgin depth (R measured 16 pts offline),
+        // but this engine measures per STRATEGY cluster, which the opposite-side-termination
+        // rule and the 1.5s span cap segment smaller — the same R event maxes at 11.00 live,
+        // and 11.00 was the whole session's per-cluster maximum (3 occurrences). At 12.0 the
+        // reversal path was structurally unreachable on NQ. VirginExtension's admissible
+        // corpus count restarts at zero from here.
+        private const double VirginMinPts        = 10.0;  // depth past the window extreme
         private const double UniMaxPrintFrac     = 0.08;  // max print / cluster volume
         private const int    UniMinPeers         = 3;     // same-side prints >= maxPrint, 300s
         // ---- carried from v2 (audit 2026-07-30), unchanged --------------------------
