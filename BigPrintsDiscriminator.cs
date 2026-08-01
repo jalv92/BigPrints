@@ -342,10 +342,11 @@ namespace NinjaTrader.NinjaScript.Strategies
             ComputeT1AndUni(p);
             ComputeContext(p);
             _pending = p;
-            // Balance-continuation (and its K-only shadow) is fully decided at t_end+0ms —
-            // the 2026-08-01 case-3 entry was AT t_end; a 5s wait is pure cost there. The
-            // virgin/reversal path still needs T2, so it waits for the freeze or the cap.
-            _pendingReady = p.Ctx == Context.BalanceSweep || p.Ctx == Context.None;
+            // Only BalanceSweep decides at t_end+0ms (the case-3 entry was AT t_end; a 5s
+            // wait is pure cost there). None/Virgin hold the 5s window so T2/T3 covariates
+            // accumulate for the corpus — the first Playback run of v3 finalized None
+            // instantly and logged T2=0 levels on every trigger of the session.
+            _pendingReady = p.Ctx == Context.BalanceSweep;
 
             _outcome = new Outcome
             {
