@@ -383,8 +383,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                         LoggingEnabled = EnableDiscriminatorLog,
                         Log = msg => Print(msg),
                     };
+                    if (Instrument.MasterInstrument.Name != "NQ")
+                        Print("[BigPrints] WARNING: discriminator v3 thresholds are registered for NQ "
+                            + "(point- and contract-denominated); on " + Instrument.MasterInstrument.Name
+                            + " they measure a different print-size/delta scale. Logging still works; "
+                            + "score the corpus per instrument.");
                 }
-                Print(string.Format("[BigPrints] mode={0} session={1:0000}-{2:0000} discLog={3}",
+                Print(string.Format("[BigPrints] disc=v3/NQ mode={0} session={1:0000}-{2:0000} discLog={3}",
                     EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog));
 
                 // Shared-governor: wipe this account's registry entry so a Playback rewind
@@ -914,10 +919,18 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Cross-thread reset handoff (see _discResetRequested field comment): the engine
             // is only ever touched from this thread, so a reset requested by DailyReset (on
             // the strategy thread) is applied here, before anything else uses _disc this tick.
+            // Flush the in-flight evaluation to the corpus first — an unlogged disappearance
+            // at a session boundary undercounts it (review finding).
             if (_discResetRequested)
             {
                 _discResetRequested = false;
-                _disc?.Reset();
+                if (_disc != null)
+                {
+                    BigPrintsDiscriminator.Evaluation ab = _disc.FlushPending(e.Time);
+                    if (ab != null && EnableDiscriminatorLog)
+                        DiscriminatorLog.AppendTrigger(ab, EntryMode.ToString(), "daily_reset");
+                    _disc.Reset();
+                }
             }
 
             // Freshest tape time, for every event type — used by PollAtmState to timestamp an
@@ -1005,6 +1018,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             _clusterMaxPrint   = e.Volume;
             _clusterPrintCount = 1;
             _clusterExtreme    = e.Price;
+            // v3 B1 hook: snapshot the open-second pre-cluster extremes (this print already
+            // went through _disc.OnPrint above, which captured the before-print values).
+            _disc?.OnClusterOpened();
         }
 
         // ponytail: unlike BigPrints.cs, there is no Terminated-time flush here — a strategy has
@@ -1785,7 +1801,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         // ── 07. Discriminator Entry ─────────────────────────────────────────
         [NinjaScriptProperty]
-        [Display(Name = "Entry Mode", Description = "Immediate = v1: enter with the cluster the moment it fires. Discriminator = wait 5s after the cluster and enter only when >=2 of the pre-registered T1/T2/T3 discriminators agree (reversal -> fade the sweep, continuation -> follow it). Thresholds are frozen constants (audit 2026-07-30), not parameters.", Order = 1, GroupName = "07. Discriminator Entry")]
+        [Display(Name = "Entry Mode", Description = "Immediate = v1: enter with the cluster the moment it fires. Discriminator = v3 context-first engine (registered for NQ, 2026-08-01): uniform sweep of a TESTED balance low -> follow it (decided at cluster end, no wait); deep virgin extension + T2 supply-collapse -> fade it (decided at T2 or +5s). Thresholds are frozen constants (audits 2026-07-30 + 2026-08-01), not parameters.", Order = 1, GroupName = "07. Discriminator Entry")]
         public BigPrintsEntryMode EntryMode { get; set; }
 
         [NinjaScriptProperty]
