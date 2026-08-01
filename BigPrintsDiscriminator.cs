@@ -155,7 +155,12 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool _t2Frozen;
         private long _d12, _d25;
 
-        // ---- outcome tracker (one slot) ---------------------------------------------
+        // ---- outcome trackers (MULTI-SLOT since 2026-08-01) ---------------------------
+        // v2/v3.0 tracked ONE outcome and superseded it on every new cluster — 79% of the
+        // first 5 sessions' labels died as UNRESOLVED_SUPERSEDED (451/574). Every trigger
+        // now resolves independently under the same checkpoint rule. Bounded: a tracker
+        // lives <= OutcomeCapSec + OutcomeWindowSec (~4 min); the cap below is far above
+        // any observed burst rate (worst measured ~10 clusters/min).
         private class Outcome
         {
             public DateTime TriggerTime;
@@ -165,7 +170,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             public DateTime ExtremeTime;
             public double   MaxUp, MaxDn;      // excursions from SweepExtreme (label-defect fix)
         }
-        private Outcome _outcome;
+        private readonly List<Outcome> _outcomes = new List<Outcome>();
+        private const int MaxOutcomeTrackers = 128;
 
         // S(t) day-state: rolling window of excursion labels from RESOLVED outcomes only
         // (rev=1 when the excursion AGAINST the sweep side beat the one WITH it). Free —
@@ -188,7 +194,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             _clusterPreHigh = double.MinValue;
             ClearPending();
             _completed = null;
-            _outcome  = null;
+            _outcomes.Clear();
             _revs.Clear(); _revSum = 0;
             _lastSeen = DateTime.MinValue;
         }
@@ -264,8 +270,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_pending != null)
                 AccumulatePending(t, price, size, isBuy);
 
-            if (_outcome != null)
-                UpdateOutcome(t, price);
+            if (_outcomes.Count > 0)
+                UpdateOutcomes(t, price);
         }
 
         // Called by the strategy the moment a NEW cluster opens (its first print has just
@@ -359,8 +365,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     superseded.DecisionTime = tEnd;
                 }
             }
-            CloseOutcome(tEnd, "UNRESOLVED_SUPERSEDED");
-
             ClearPending();
             var p = new Evaluation
             {
@@ -380,11 +384,17 @@ namespace NinjaTrader.NinjaScript.Strategies
             // instantly and logged T2=0 levels on every trigger of the session.
             _pendingReady = p.Ctx == Context.BalanceSweep;
 
-            _outcome = new Outcome
+            if (_outcomes.Count >= MaxOutcomeTrackers)
+            {
+                Log("[BigPrints/disc] WARNING: outcome-tracker cap hit — dropping oldest (should be unreachable).");
+                CloseOne(_outcomes[0], tEnd, "UNRESOLVED_OVERFLOW");
+                _outcomes.RemoveAt(0);
+            }
+            _outcomes.Add(new Outcome
             {
                 TriggerTime = tEnd, IsBuySweep = isBuy,
                 SweepExtreme = sweepExtreme, Extreme = sweepExtreme, ExtremeTime = tEnd,
-            };
+            });
             return superseded;
         }
 
@@ -535,8 +545,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     p.KOnly    = true; // context passed alone — scored in parallel by the corpus
                 }
             }
-            else if (p.Ctx == Context.VirginExtension && p.T2 == Verdict.Reversal)
-                p.Decision = Verdict.Reversal;
+            // VirginExtension+T2 reversal path DEMOTED TO LOG-ONLY 2026-08-01 (Javier's
+            // call after the 5-session batch review): 13 virgin contexts, 9 with a starved
+            // T2 (<=4 extension levels — the sweep marks the extreme and nothing extends,
+            // so the rule cannot evaluate), and its single firing (a compression breakout,
+            // not an R-style trend-leg flush) lost. The JSONL still carries ctx+T2, so the
+            // corpus keeps scoring the would-be call; no orders until a reformulation is
+            // pre-registered.
             else
                 p.Decision = Verdict.Abstain;
 
@@ -603,48 +618,54 @@ namespace NinjaTrader.NinjaScript.Strategies
                 p.DecisionTime = t;
                 ClearPending();
             }
-            CloseOutcome(t, "UNRESOLVED_SUPERSEDED");
+            CloseAllOutcomes(t, "UNRESOLVED_SUPERSEDED");
             return p;
         }
 
-        // Outcome label — checkpoint rule (amended 2026-07-30), plus the 2026-08-01
-        // label-defect fix: track both excursions from the sweep extreme so the corpus
-        // scorer can see the MAE a "correct" label would have cost.
-        private void UpdateOutcome(DateTime t, double price)
+        // Outcome labels — checkpoint rule (amended 2026-07-30), 2026-08-01 label-defect
+        // fix (MaxUp/MaxDn), multi-slot since 2026-08-01: every tracker advances and
+        // resolves independently; resolved ones are removed in place.
+        private void UpdateOutcomes(DateTime t, double price)
         {
-            Outcome o = _outcome;
-
-            double up = price - o.SweepExtreme, dn = o.SweepExtreme - price;
-            if (up > o.MaxUp) o.MaxUp = up;
-            if (dn > o.MaxDn) o.MaxDn = dn;
-
-            bool newExtreme = o.IsBuySweep ? price > o.Extreme : price < o.Extreme;
-            if (newExtreme)
+            for (int i = _outcomes.Count - 1; i >= 0; i--)
             {
-                o.Extreme = price; o.ExtremeTime = t;
-            }
+                Outcome o = _outcomes[i];
 
-            double ext = Math.Abs(o.SweepExtreme - o.Extreme);
+                double up = price - o.SweepExtreme, dn = o.SweepExtreme - price;
+                if (up > o.MaxUp) o.MaxUp = up;
+                if (dn > o.MaxDn) o.MaxDn = dn;
 
-            if ((t - o.ExtremeTime).TotalSeconds > OutcomeWindowSec)
-            {
-                if (ext < _tickSize / 2) { ResolveOutcome(t, "UNRESOLVED", 0); return; }
-                double recovery = o.IsBuySweep ? (o.Extreme - price) / ext : (price - o.Extreme) / ext;
-                ResolveOutcome(t, recovery >= OutcomeRecoveryFrac ? "REVERSAL" : "CONTINUATION", recovery);
-                return;
-            }
-            if ((t - o.TriggerTime).TotalSeconds > OutcomeCapSec)
-            {
-                double bestAtCap = o.IsBuySweep ? (o.Extreme - price) / ext : (price - o.Extreme) / ext;
-                ResolveOutcome(t, "CONTINUATION", bestAtCap);
+                bool newExtreme = o.IsBuySweep ? price > o.Extreme : price < o.Extreme;
+                if (newExtreme)
+                {
+                    o.Extreme = price; o.ExtremeTime = t;
+                }
+
+                double ext = Math.Abs(o.SweepExtreme - o.Extreme);
+
+                if ((t - o.ExtremeTime).TotalSeconds > OutcomeWindowSec)
+                {
+                    if (ext < _tickSize / 2)
+                        ResolveOutcome(o, t, "UNRESOLVED", 0);
+                    else
+                    {
+                        double recovery = o.IsBuySweep ? (o.Extreme - price) / ext : (price - o.Extreme) / ext;
+                        ResolveOutcome(o, t, recovery >= OutcomeRecoveryFrac ? "REVERSAL" : "CONTINUATION", recovery);
+                    }
+                    _outcomes.RemoveAt(i);
+                }
+                else if ((t - o.TriggerTime).TotalSeconds > OutcomeCapSec)
+                {
+                    double bestAtCap = o.IsBuySweep ? (o.Extreme - price) / ext : (price - o.Extreme) / ext;
+                    ResolveOutcome(o, t, "CONTINUATION", bestAtCap);
+                    _outcomes.RemoveAt(i);
+                }
             }
         }
 
-        private void ResolveOutcome(DateTime t, string label, double recovery)
+        private void ResolveOutcome(Outcome o, DateTime t, string label, double recovery)
         {
-            Outcome o = _outcome;
-            _outcome = null;
-            // Feed S(t): real resolutions only (superseded partials go via CloseOutcome).
+            // Feed S(t): real resolutions only (flush/overflow partials go via CloseOne).
             int rev = (o.IsBuySweep ? o.MaxDn > o.MaxUp : o.MaxUp > o.MaxDn) ? 1 : 0;
             _revs.Enqueue(rev); _revSum += rev;
             if (_revs.Count > SStateWindow) _revSum -= _revs.Dequeue();
@@ -656,16 +677,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                     o.Extreme, t, o.MaxUp / _tickSize, o.MaxDn / _tickSize);
         }
 
-        private void CloseOutcome(DateTime t, string label)
+        private void CloseOne(Outcome o, DateTime t, string label)
         {
-            if (_outcome == null)
-                return;
-            Outcome o = _outcome;
-            _outcome = null;
             double extTicks = Math.Abs(o.SweepExtreme - o.Extreme) / _tickSize;
             if (LoggingEnabled)
                 DiscriminatorLog.AppendOutcome(o.TriggerTime, _instrument, label, extTicks, 0,
                     o.Extreme, t, o.MaxUp / _tickSize, o.MaxDn / _tickSize);
+        }
+
+        private void CloseAllOutcomes(DateTime t, string label)
+        {
+            foreach (Outcome o in _outcomes)
+                CloseOne(o, t, label);
+            _outcomes.Clear();
         }
     }
 

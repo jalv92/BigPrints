@@ -62,7 +62,7 @@ def main(path):
                 if missing:
                     print("  FAIL line %d: outcome missing %s" % (i, sorted(missing)))
                     errors += 1
-                if r.get("label") not in ("REVERSAL", "CONTINUATION", "UNRESOLVED", "UNRESOLVED_SUPERSEDED"):
+                if r.get("label") not in ("REVERSAL", "CONTINUATION", "UNRESOLVED", "UNRESOLVED_SUPERSEDED", "UNRESOLVED_OVERFLOW"):
                     print("  FAIL line %d: bad outcome label %r" % (i, r.get("label")))
                     errors += 1
                 outcomes[r.get("trigger_ts")] = r
@@ -109,11 +109,16 @@ def main(path):
                       if t["ctx"]["verdict"] == "BalanceSweep" and t["uni"]["ok"]]
         bal_konly  = [(t, o) for t, o in v3 if t["ctx"].get("k_only")]
         bal_all    = [(t, o) for t, o in v3 if t["ctx"]["verdict"] == "BalanceSweep"]
-        rev_traded = [(t, o) for t, o in v3 if t["decision"] == "Reversal"]
+        # Virgin+T2 was demoted to log-only 2026-08-01: reconstruct the would-be call
+        # from the logged covariates (decision=="Reversal" no longer occurs).
+        rev_shadow = [(t, o) for t, o in v3
+                      if t["ctx"]["verdict"] == "VirginExtension" and t["t2"]["verdict"] == "Reversal"]
+        virg_all   = [(t, o) for t, o in v3 if t["ctx"]["verdict"] == "VirginExtension"]
         print("v3 CTX+UNI (traded continuation): %s" % score(bal_traded, "CONTINUATION"))
         print("v3 K-only shadow (ctx passed, uni failed): %s" % score(bal_konly, "CONTINUATION"))
         print("v3 CTX-any-balance (both above): %s" % score(bal_all, "CONTINUATION"))
-        print("v3 reversal path (virgin + T2): %s" % score(rev_traded, "REVERSAL"))
+        print("v3 reversal shadow (virgin+T2, LOG-ONLY): %s" % score(rev_shadow, "REVERSAL"))
+        print("v3 virgin contexts (any T2): %s" % score(virg_all, "REVERSAL"))
 
         # Label-defect guard: a "correct" call with a huge adverse excursion is not a win.
         maes = [(o.get("max_up_ticks"), o.get("max_dn_ticks")) for _, o in v3
