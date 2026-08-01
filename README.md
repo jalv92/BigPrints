@@ -244,13 +244,40 @@ Set **Enable Recorder** on the indicator to get a **Record** button on the chart
 (Playback tool). Click it ~1 minute *before* an expected big print: the button turns
 `ARMED…` and the recorder buffers tape (including inside-spread prints), best bid/ask
 size updates and top-10 L2 snapshots (250 ms) in RAM. The next cluster ≥ Min Volume
-turns it `REC…`, captures 120 s more, then writes one JSON to
+turns it `REC…`, captures 180 s more, then writes one JSON to
 `Documents/NinjaTrader 8/BigPrintsAI/recordings/YYYY-MM-DD/` and disarms. Click while
 armed to cancel; click while recording to finalize early (partial file). Playback
 rewinds/jumps discard the buffer automatically.
 
-Validate a capture: `python3 tools/validate_recording.py <recording.json>`.
-Design: workspace `docs/superpowers/specs/2026-07-30-bigprints-event-recorder-design.md`.
+**Auto Mode** (v2, 2026-08-01): set **Auto Mode** on and the recorder arms itself —
+no clicks — and captures three trigger types, each tagged in the filename and in
+`meta.trigger.type`:
+
+- `sweep` — every cluster ≥ Min Volume (**Auto: Capture Sweeps**, on by default; this
+  is the denominator the pair audit demanded — negatives included).
+- `accum` — **Auto: Accumulation Clusters** (default 3, 0 = off) same-side clusters
+  ≥ Min Volume within **Auto: Accumulation Window** (default 180 s). Targets the
+  observed pattern: repeated big sells, then the drop.
+- `stoprun` — price traveling **Auto: Stop-Run Ticks** (default 40, 0 = off) within
+  **Auto: Stop-Run Window** (default 10 s) with the current print at the leading edge
+  of the move. Targets "the stops just got run" flushes; `trigger.range_ticks` carries
+  the displacement.
+
+One recording is active at a time: triggers landing inside an open window are appended
+to `meta.other_clusters` (with their type) and **extend** the recording by 180 s each,
+hard-capped at 10 min (`meta.capped`). While recording, book snapshots tighten to
+100 ms and every new post-trigger extreme (new low for sell events / high for buy)
+forces an immediate snapshot — "was the bottom thin or defended?" is answerable.
+After each file the recorder re-arms itself (pre-context rebuilds from that moment);
+**Auto: Max Files Per Session** (default 40) is the disk guard. A worst-case capped
+file on active tape can reach tens of MB. Playback rewinds discard the active capture
+and re-arm at the new tape time — after a rewind you may capture the same event twice;
+dedupe offline by `meta.t0` + trigger.
+
+Validate/triage a capture (prints the post-trigger price path at +30/60/120/180 s):
+`python3 tools/validate_recording.py <recording.json>`.
+Design: workspace `docs/superpowers/specs/2026-07-30-bigprints-event-recorder-design.md`
++ `2026-08-01-bigprints-recorder-auto-triggers-design.md`.
 
 ## Discriminator Entry Mode (strategy v2)
 

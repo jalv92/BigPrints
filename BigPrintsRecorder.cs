@@ -5,16 +5,26 @@ using System.Threading.Tasks;
 using Newtonsoft.Json;
 #endregion
 
-// BigPrintsRecorder v1.0 — manual "armed" capture of raw microstructure (tape prints
-// including inside-spread ones, best bid/ask size updates, sampled L2 snapshots) around
-// ONE big-print cluster per Record click, for offline diagnosis of why price reacted.
-// Spec: workspace docs/superpowers/specs/2026-07-30-bigprints-event-recorder-design.md
+// BigPrintsRecorder v2.0 — capture of raw microstructure (tape prints including
+// inside-spread ones, best bid/ask size updates, sampled L2 snapshots) around
+// big-print events, for offline diagnosis of why price reacted.
+// Specs: workspace docs/superpowers/specs/2026-07-30-bigprints-event-recorder-design.md
+//        + 2026-08-01-bigprints-recorder-auto-triggers-design.md
 //
-// Lifecycle: Off -> (Record click) Armed [buffers fill, nothing written]
-//            -> (first cluster >= MinVolume) Recording [keep buffering 120s more]
-//            -> write one JSON file on a background task -> Off.
-// Click while Armed cancels; click while Recording finalizes early (partial file).
-// A playback rewind/jump discards everything and disarms.
+// Modes:
+//   Manual (v1): Off -> (Record click) Armed [buffers fill, nothing written]
+//                -> (first sweep cluster >= MinVolume) Recording -> one JSON -> Off.
+//                Click while Armed cancels; click while Recording finalizes early.
+//   Auto: arms itself on the first market event, re-arms after every file and after
+//         a playback jump/rewind discard; the indicator fires typed triggers
+//         (sweep / accum / stoprun) with no click. A file cap stops disk runaway.
+//
+// Recording window: first trigger t_end + PostEventSeconds; every further trigger
+// inside the window EXTENDS the deadline to its own t_end + PostEventSeconds,
+// hard-capped at MaxRecordingSecs after the first trigger (meta.capped = true).
+// While Recording the book cadence tightens to BookSnapshotRecMs, and any tape
+// print making a new post-trigger extreme toward the trigger side requests an
+// immediate snapshot — the sweep itself is not blind (pair audit §4.6).
 //
 // Threading: public methods are called from the market-data thread, the market-depth
 // thread (under the indicator's SyncMarketDepth lock) and the UI thread (button).
@@ -31,10 +41,12 @@ namespace NinjaTrader.NinjaScript.Indicators
         public Action<string>        Log          = delegate { };
         public Action<RecorderState> StateChanged = delegate { };
 
-        private const int    PostEventSeconds  = 120;  // keep recording this long after the trigger cluster
+        private const int    PostEventSeconds  = 180;  // keep recording this long after the LATEST trigger
+        private const int    MaxRecordingSecs  = 600;  // hard cap measured from the FIRST trigger's t_end
         private const int    PreContextCapSecs = 300;  // ARMED buffer cap, rolling (spec §7)
-        private const int    BookSnapshotMs    = 250;
-        private const int    MaxOtherClusters  = 20;
+        private const int    BookSnapshotMs    = 250;  // sampling cadence while Armed
+        private const int    BookSnapshotRecMs = 100;  // tighter cadence while Recording
+        private const int    MaxOtherClusters  = 40;
         private const double BackwardsTolSecs  = 2;    // cross-thread timestamp skew tolerance
         private const int    JumpForwardSecs   = 30;   // bigger forward gap in the tape = user jumped playback
 
@@ -43,19 +55,30 @@ namespace NinjaTrader.NinjaScript.Indicators
         private class  BookSnap    { public DateTime T; public double[][] Bids; public double[][] Asks; }
         private class ClusterInfo
         {
+            public string   Type;            // "sweep" | "accum" | "stoprun"
             public DateTime MaxTime, TStart, TEnd;
             public bool     IsBuy;
             public double   MaxPrintPrice;
             public long     MaxPrintSize, Volume;
-            public int      NPrints;
+            public int      NPrints;         // prints (sweep/stoprun) or clusters (accum)
+            public int      RangeTicks;      // stoprun displacement; 0 otherwise
         }
 
         private readonly string _baseDir;
         private readonly object _lock = new object();
         private RecorderState _state = RecorderState.Off;
+        private bool _auto;                  // auto mode: self-arm, typed triggers, re-arm after write
+        private bool _sweepInitiates = true; // false only in auto mode with AutoTriggerSweeps off
+        private int  _maxFiles = int.MaxValue;
+        private int  _filesWritten;
         private DateTime _armedAt;
         private DateTime _lastSeen;       // last event timestamp seen while active (jump detection)
         private DateTime _lastBookSnapAt;
+        private DateTime _deadline;       // Recording ends here (extended per trigger)
+        private DateTime _hardCapAt;      // ... but never past here
+        private double _postExtreme;      // best post-trigger price toward the trigger side
+        private bool   _snapAsap;         // a new extreme printed — snapshot on the next depth event
+        private double _lastTapePrice;    // freshest Last print — seeds _postExtreme (market state, survives resets)
         private Queue<TapeEntry>   _tape   = new Queue<TapeEntry>();
         private Queue<InsideEntry> _inside = new Queue<InsideEntry>();
         private Queue<BookSnap>    _book   = new Queue<BookSnap>();
@@ -65,6 +88,17 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         public BigPrintsRecorder(string baseDir) { _baseDir = baseDir; }
 
+        // Called once from DataLoaded, before any market event reaches the recorder.
+        public void Configure(bool autoMode, bool sweepInitiates, int maxFiles)
+        {
+            lock (_lock)
+            {
+                _auto           = autoMode;
+                _sweepInitiates = sweepInitiates;
+                _maxFiles       = maxFiles;
+            }
+        }
+
         public RecorderState State { get { lock (_lock) return _state; } }
 
         public void Toggle(DateTime tapeNow)
@@ -73,9 +107,18 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 if (_state == RecorderState.Off)
                 {
+                    if (_auto)
+                    {
+                        Log(_filesWritten >= _maxFiles
+                            ? "BigPrints recorder: auto file cap reached (" + _filesWritten + ") — reload the indicator to record more."
+                            : "BigPrints recorder: auto mode arms itself — nothing to click.");
+                        return;
+                    }
                     if (tapeNow == default(DateTime)) { Log("BigPrints recorder: no tape seen yet — cannot arm."); return; }
                     ResetBuffersLocked();
-                    _armedAt  = tapeNow;
+                    // t0 sits BackwardsTolSecs behind the arm instant so cross-thread
+                    // events skewed within tolerance never get a negative ms-since-t0.
+                    _armedAt  = tapeNow.AddSeconds(-BackwardsTolSecs);
                     _lastSeen = tapeNow;
                     _state    = RecorderState.Armed;
                     StateChanged(_state);
@@ -83,14 +126,15 @@ namespace NinjaTrader.NinjaScript.Indicators
                 }
                 else if (_state == RecorderState.Armed)
                 {
+                    if (_auto) { Log("BigPrints recorder: auto mode is always armed — turn Auto Mode off for manual control."); return; }
                     ResetBuffersLocked();
                     _state = RecorderState.Off;
                     StateChanged(_state);
                     Log("BigPrints recorder: canceled, nothing written.");
                 }
-                else // Recording — finalize early
+                else // Recording — finalize early (useful in both modes)
                 {
-                    FinalizeLocked(true);
+                    FinalizeLocked(true, false, true, tapeNow == default(DateTime) ? _lastSeen : tapeNow);
                 }
             }
         }
@@ -99,8 +143,15 @@ namespace NinjaTrader.NinjaScript.Indicators
         {
             lock (_lock)
             {
+                _lastTapePrice = price;
                 if (!TimeCheckLocked(t)) return;
                 _tape.Enqueue(new TapeEntry { T = t, Price = price, Size = size, Side = side, Bid = bid, Ask = ask });
+                if (_state == RecorderState.Recording && _trigger != null &&
+                    (_trigger.IsBuy ? price > _postExtreme : price < _postExtreme))
+                {
+                    _postExtreme = price;
+                    _snapAsap    = true;
+                }
                 TrimLocked(t);
             }
         }
@@ -119,7 +170,14 @@ namespace NinjaTrader.NinjaScript.Indicators
         public bool WantsBookSnapshot(DateTime t)
         {
             lock (_lock)
-                return _state != RecorderState.Off && (t - _lastBookSnapAt).TotalMilliseconds >= BookSnapshotMs;
+            {
+                if (_state == RecorderState.Off && !(_auto && _filesWritten < _maxFiles))
+                    return false;
+                if (_snapAsap)
+                    return true;
+                int cadence = _state == RecorderState.Recording ? BookSnapshotRecMs : BookSnapshotMs;
+                return (t - _lastBookSnapAt).TotalMilliseconds >= cadence;
+            }
         }
 
         public void OnBookSnapshot(DateTime t, double[][] bids, double[][] asks)
@@ -128,13 +186,16 @@ namespace NinjaTrader.NinjaScript.Indicators
             {
                 if (!TimeCheckLocked(t)) return;
                 _lastBookSnapAt = t;
+                _snapAsap       = false;
                 _book.Enqueue(new BookSnap { T = t, Bids = bids, Asks = asks });
                 TrimLocked(t);
             }
         }
 
-        public void OnClusterTrigger(DateTime maxTime, bool isBuy, double maxPrintPrice, long maxPrintSize,
-            long volume, int nPrints, DateTime tStart, DateTime tEnd,
+        // Typed trigger from the indicator. Armed -> start Recording (sweeps only if they
+        // may initiate); Recording -> log it and extend the window.
+        public void OnTrigger(string type, DateTime maxTime, bool isBuy, double maxPrintPrice, long maxPrintSize,
+            long volume, int nPrints, int rangeTicks, DateTime tStart, DateTime tEnd,
             string instrument, string barsText, string sessionText)
         {
             lock (_lock)
@@ -142,24 +203,36 @@ namespace NinjaTrader.NinjaScript.Indicators
                 if (!TimeCheckLocked(tEnd)) return;
                 var info = new ClusterInfo
                 {
-                    MaxTime = maxTime, TStart = tStart, TEnd = tEnd, IsBuy = isBuy,
+                    Type = type, MaxTime = maxTime, TStart = tStart, TEnd = tEnd, IsBuy = isBuy,
                     MaxPrintPrice = maxPrintPrice, MaxPrintSize = maxPrintSize,
-                    Volume = volume, NPrints = nPrints,
+                    Volume = volume, NPrints = nPrints, RangeTicks = rangeTicks,
                 };
                 if (_state == RecorderState.Armed)
                 {
+                    if (type == "sweep" && !_sweepInitiates)
+                        return; // context only — still fully visible in the buffered tape
                     _trigger     = info;
                     _instrument  = instrument;
                     _barsText    = barsText;
                     _sessionText = sessionText;
+                    // Seed from the freshest print, not the trigger's max-print price:
+                    // for "accum" that price can be minutes old and would anchor the
+                    // new-extreme snapshot logic to a stale level (review finding).
+                    _postExtreme = _lastTapePrice != 0 ? _lastTapePrice : maxPrintPrice;
+                    _deadline    = tEnd.AddSeconds(PostEventSeconds);
+                    _hardCapAt   = tEnd.AddSeconds(MaxRecordingSecs);
                     _state       = RecorderState.Recording;
                     StateChanged(_state);
-                    Log("BigPrints recorder: TRIGGERED by " + (isBuy ? "BUY " : "SELL ") + volume
-                        + " @ " + maxPrintPrice.ToString("F2") + " — recording " + PostEventSeconds + "s post.");
+                    Log("BigPrints recorder: TRIGGERED [" + type + "] " + (isBuy ? "BUY " : "SELL ") + volume
+                        + " @ " + maxPrintPrice.ToString("F2") + " — recording " + PostEventSeconds + "s post (extendable).");
                 }
-                else if (_state == RecorderState.Recording && _others.Count < MaxOtherClusters)
+                else if (_state == RecorderState.Recording)
                 {
-                    _others.Add(info);
+                    if (_others.Count < MaxOtherClusters)
+                        _others.Add(info);
+                    DateTime d = tEnd.AddSeconds(PostEventSeconds);
+                    if (d > _deadline)
+                        _deadline = d; // hard cap enforced in TimeCheckLocked
                 }
             }
         }
@@ -169,40 +242,64 @@ namespace NinjaTrader.NinjaScript.Indicators
             lock (_lock)
             {
                 if (_state == RecorderState.Recording)
-                    FinalizeLocked(true);
-                else if (_state == RecorderState.Armed)
+                    FinalizeLocked(true, false, false, default(DateTime)); // no re-arm: teardown
+                if (_state != RecorderState.Off)
                 {
                     ResetBuffersLocked();
                     _state = RecorderState.Off;
-                    // no StateChanged: the chart is being torn down
+                    // no StateChanged: teardown
                 }
             }
         }
 
         // Returns false when the caller must drop the event (recorder off / just reset).
-        // Also drives the post-window finalize and the playback-jump reset.
+        // Also drives auto-arming, the post-window finalize and the playback-jump reset.
         private bool TimeCheckLocked(DateTime t)
         {
             if (_state == RecorderState.Off)
-                return false;
+            {
+                if (!_auto || _filesWritten >= _maxFiles)
+                    return false;
+                ResetBuffersLocked();
+                _armedAt  = t.AddSeconds(-BackwardsTolSecs);
+                _lastSeen = t;
+                _state    = RecorderState.Armed;
+                StateChanged(_state);
+                Log("BigPrints recorder: AUTO-ARMED at " + t.ToString("HH:mm:ss") + ".");
+                return true;
+            }
+
+            // Deadline BEFORE the jump check: a quiet tape gap can exceed JumpForwardSecs
+            // right at window expiry, and the jump branch would then DISCARD a fully-formed
+            // capture (review finding). A backward jump cannot satisfy t >= _deadline, so
+            // rewinds still fall through to the jump handling below.
+            if (_state == RecorderState.Recording && (t >= _deadline || t >= _hardCapAt))
+            {
+                bool capped = t >= _hardCapAt && _deadline > _hardCapAt;
+                FinalizeLocked(false, capped, true, t);
+                // In auto mode FinalizeLocked re-armed us — this event belongs to the new pre-context.
+                return _state == RecorderState.Armed;
+            }
 
             if (t < _lastSeen.AddSeconds(-BackwardsTolSecs) || (t - _lastSeen).TotalSeconds > JumpForwardSecs)
             {
                 Log("BigPrints recorder: playback time jump (" + _lastSeen.ToString("HH:mm:ss")
                     + " -> " + t.ToString("HH:mm:ss") + ") — recording discarded.");
                 ResetBuffersLocked();
+                if (_auto && _filesWritten < _maxFiles)
+                {
+                    _armedAt  = t.AddSeconds(-BackwardsTolSecs);
+                    _lastSeen = t;
+                    _state    = RecorderState.Armed;
+                    StateChanged(_state);
+                    return true; // this event opens the new pre-context
+                }
                 _state = RecorderState.Off;
                 StateChanged(_state);
                 return false;
             }
             if (t > _lastSeen)
                 _lastSeen = t;
-
-            if (_state == RecorderState.Recording && (t - _trigger.TEnd).TotalSeconds >= PostEventSeconds)
-            {
-                FinalizeLocked(false);
-                return false; // this event is past the window
-            }
             return true;
         }
 
@@ -225,10 +322,18 @@ namespace NinjaTrader.NinjaScript.Indicators
             _others = new List<ClusterInfo>();
             _trigger = null;
             _lastBookSnapAt = default(DateTime);
+            _deadline    = default(DateTime);
+            _hardCapAt   = default(DateTime);
+            _postExtreme = 0;
+            _snapAsap    = false;
         }
 
-        // Detach the buffers, go Off, hand the payload to a background writer task.
-        private void FinalizeLocked(bool partial)
+        // Detach the buffers, hand the payload to a background writer task, then either
+        // re-arm (auto mode, under the file cap) or go Off. rearmAt seeds the next
+        // epoch's clock — the FINALIZING event's own time, not the stale _lastSeen,
+        // so a post-finalize quiet gap or cross-thread skew can't corrupt the new
+        // file's t0 or trip a spurious jump discard (review finding).
+        private void FinalizeLocked(bool partial, bool capped, bool rearm, DateTime rearmAt)
         {
             Queue<TapeEntry>   tape    = _tape;
             Queue<InsideEntry> inside  = _inside;
@@ -239,9 +344,23 @@ namespace NinjaTrader.NinjaScript.Indicators
             string instrument          = _instrument;
             string barsText            = _barsText;
             string sessionText         = _sessionText;
+            bool auto                  = _auto;
 
+            _filesWritten++;
             ResetBuffersLocked();
-            _state = RecorderState.Off;
+            if (auto && rearm && _filesWritten < _maxFiles)
+            {
+                DateTime seed = rearmAt == default(DateTime) ? _lastSeen : rearmAt;
+                _armedAt  = seed.AddSeconds(-BackwardsTolSecs);
+                _lastSeen = seed > _lastSeen ? seed : _lastSeen;
+                _state    = RecorderState.Armed;
+            }
+            else
+            {
+                _state = RecorderState.Off;
+                if (auto && _filesWritten >= _maxFiles)
+                    Log("BigPrints recorder: auto file cap reached (" + _filesWritten + ") — capture stopped for this session.");
+            }
             StateChanged(_state);
 
             Task.Run(() =>
@@ -249,14 +368,15 @@ namespace NinjaTrader.NinjaScript.Indicators
                 try
                 {
                     string path = WriteFile(t0, trigger, others, tape, inside, book,
-                        instrument, barsText, sessionText, partial);
+                        instrument, barsText, sessionText, partial, capped, auto);
                     Log("BigPrints recorder: wrote " + path
                         + " (" + tape.Count + " prints, " + inside.Count + " inside updates, "
-                        + book.Count + " book snapshots" + (partial ? ", PARTIAL" : "") + ")");
+                        + book.Count + " book snapshots" + (partial ? ", PARTIAL" : "") + (capped ? ", CAPPED" : "") + ")");
                 }
                 catch (Exception ex)
                 {
                     Log("BigPrints recorder: write FAILED — " + ex.Message);
+                    lock (_lock) _filesWritten--; // a failed write must not consume the file cap
                 }
             });
         }
@@ -266,11 +386,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 
         private string WriteFile(DateTime t0, ClusterInfo trigger, List<ClusterInfo> others,
             Queue<TapeEntry> tape, Queue<InsideEntry> inside, Queue<BookSnap> book,
-            string instrument, string barsText, string sessionText, bool partial)
+            string instrument, string barsText, string sessionText, bool partial, bool capped, bool auto)
         {
             string dir = System.IO.Path.Combine(_baseDir, trigger.MaxTime.ToString("yyyy-MM-dd"));
             System.IO.Directory.CreateDirectory(dir);
-            string name = "event_" + trigger.MaxTime.ToString("HHmmss") + "_"
+            // Milliseconds + type in the name: same-second events no longer overwrite each other.
+            string name = "event_" + trigger.MaxTime.ToString("HHmmssfff") + "_" + trigger.Type + "_"
                 + (trigger.IsBuy ? "buy" : "sell") + trigger.Volume + ".json";
             string path = System.IO.Path.Combine(dir, name);
 
@@ -284,7 +405,9 @@ namespace NinjaTrader.NinjaScript.Indicators
                 w.WritePropertyName("instrument");    w.WriteValue(instrument);
                 w.WritePropertyName("t0");            w.WriteValue(t0.ToString("yyyy-MM-ddTHH:mm:ss.fff"));
                 w.WritePropertyName("t_unit");        w.WriteValue("ms since t0 (playback tape time)");
+                w.WritePropertyName("recorder_mode"); w.WriteValue(auto ? "auto" : "manual");
                 w.WritePropertyName("partial");       w.WriteValue(partial);
+                w.WritePropertyName("capped");        w.WriteValue(capped);
                 w.WritePropertyName("trigger");       WriteCluster(w, t0, trigger);
                 w.WritePropertyName("other_clusters");
                 w.WriteStartArray();
@@ -338,11 +461,13 @@ namespace NinjaTrader.NinjaScript.Indicators
         private static void WriteCluster(JsonTextWriter w, DateTime t0, ClusterInfo c)
         {
             w.WriteStartObject();
+            w.WritePropertyName("type");            w.WriteValue(c.Type);
             w.WritePropertyName("side");            w.WriteValue(c.IsBuy ? "buy" : "sell");
             w.WritePropertyName("volume");          w.WriteValue(c.Volume);
             w.WritePropertyName("max_print_price"); w.WriteValue(c.MaxPrintPrice);
             w.WritePropertyName("max_print_size");  w.WriteValue(c.MaxPrintSize);
             w.WritePropertyName("n_prints");        w.WriteValue(c.NPrints);
+            w.WritePropertyName("range_ticks");     w.WriteValue(c.RangeTicks);
             w.WritePropertyName("t_start_ms");      w.WriteValue(Ms(t0, c.TStart));
             w.WritePropertyName("t_end_ms");        w.WriteValue(Ms(t0, c.TEnd));
             w.WriteEndObject();

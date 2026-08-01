@@ -92,10 +92,25 @@ namespace NinjaTrader.NinjaScript.Indicators
         // as the gap between two reads is under that span — always true for a sub-10s cooldown.
         private int _lastSoundTick;
 
-        // ---- Event Recorder (spec 2026-07-30) ----------------------------------------
+        // ---- Event Recorder (specs 2026-07-30 + 2026-08-01 auto-triggers) -------------
         // Null unless EnableRecorder — every hook below is a no-op via `_recorder?.`.
         private BigPrintsRecorder _recorder;
         private int _clusterPrintCount;   // prints folded into the open cluster (recorder metadata)
+
+        // Stop-run detector (auto mode only) — rolling window of aggressor Last prints
+        // with monotonic max/min deques so a tape burst never scans the window per print.
+        // All on the market-data Last path, same single-threaded assumption as the
+        // cluster state above; time-based eviction keeps the deques honest.
+        private struct SrPrint { public DateTime T; public double P; public long V; }
+        private readonly Queue<SrPrint>      _srWindow = new Queue<SrPrint>();
+        private readonly LinkedList<SrPrint> _srMax    = new LinkedList<SrPrint>(); // decreasing prices
+        private readonly LinkedList<SrPrint> _srMin    = new LinkedList<SrPrint>(); // increasing prices
+        private long _srVolSum;
+        // Epoch guard: a live Playback slider rewind does NOT re-run DataLoaded, so
+        // detector memory (_recentClusters, _sr*) would splice two tape epochs — stale
+        // FUTURE-stamped entries pollute the windows (review finding). Cleared on any
+        // backward time regression beyond the recorder's own skew tolerance.
+        private DateTime _lastDetectorTime;
 
         // ---- AI Advisor data-capture layer -------------------------------------------
         // L2 book maintained from OnMarketDepth, per NinjaTrader's own SampleLevel2Book:
@@ -122,7 +137,11 @@ namespace NinjaTrader.NinjaScript.Indicators
         }
         private readonly object _clusterMemLock = new object();
         private readonly Queue<ClusterRecord> _recentClusters = new Queue<ClusterRecord>();
-        private const int MaxClusterMemory = 50;
+        // ponytail: count cap, not time cap — 300 covers any realistic AccumWindowSec
+        // (900s at one qualifying cluster every 3s); a time-bounded structure only if a
+        // real session ever evicts in-window clusters (was 50, review finding: silent
+        // accum undercount on busy tape).
+        private const int MaxClusterMemory = 300;
 
         // Session stats since chart load (approximation of session — honest label is
         // applied at serialize time). Written on the market-data thread only; reads
@@ -230,6 +249,13 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 AnalysisSoundFile    = "";
                 ShowFullAnalysis     = false;
                 EnableRecorder       = false;
+                RecorderAutoMode     = false;
+                AutoTriggerSweeps    = true;
+                AccumMinClusters     = 3;
+                AccumWindowSec       = 180;
+                StopRunTicks         = 40;
+                StopRunWindowSec     = 10;
+                AutoMaxFilesPerSession = 40;
             }
             else if (State == State.Configure)
             {
@@ -264,9 +290,22 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 {
                     _recorder = new BigPrintsRecorder(System.IO.Path.Combine(
                         NinjaTrader.Core.Globals.UserDataDir, "BigPrintsAI", "recordings"));
+                    _recorder.Configure(RecorderAutoMode,
+                        !RecorderAutoMode || AutoTriggerSweeps, AutoMaxFilesPerSession);
                     _recorder.Log = msg => Print(msg);
                     _recorder.StateChanged = OnRecorderStateChanged;
                 }
+
+                // Detector state must not survive a Playback restart: stale clusters carry
+                // FUTURE tape times after a rewind and would satisfy the accumulation
+                // window instantly; the stop-run window would mix two tape epochs.
+                lock (_clusterMemLock)
+                    _recentClusters.Clear();
+                _srWindow.Clear();
+                _srMax.Clear();
+                _srMin.Clear();
+                _srVolSum = 0;
+                _lastDetectorTime = default(DateTime);
             }
             else if (State == State.Historical)
             {
@@ -296,7 +335,7 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                             Margin     = new Thickness(0, 0, 8, 0),
                             Foreground = Brushes.White,
                             Background = Brushes.DarkSlateGray,
-                            ToolTip    = "Arm ~1 min BEFORE the expected big print - pre-context starts at this click. Click again to cancel (armed) or finalize early (recording).",
+                            ToolTip    = "Manual: arm ~1 min BEFORE the expected big print - pre-context starts at this click; click again to cancel (armed) or finalize early (recording). Auto Mode: arms itself and captures sweep/accum/stoprun triggers - click only to finalize an active recording early.",
                         };
                         _recordButton.Click += OnRecordClick;
                         panel.Children.Add(_recordButton);
@@ -350,7 +389,6 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                         if (_analyzeButton != null)
                         {
                             _analyzeButton.Click -= OnAnalyzeClick;
-                            _analyzeGrid?.Children.Remove(_analyzeButton);
                             _analyzeButton = null;
                         }
                         if (_recordButton != null)
@@ -490,6 +528,21 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             if (e.MarketDataType != MarketDataType.Last)
                 return;
 
+            // Detector epoch guard: on a live Playback rewind (slider back, no DataLoaded)
+            // detector memory holds FUTURE-stamped entries from the abandoned tape segment —
+            // they would pollute the accum window and break the stop-run deques' monotonic
+            // assumption (review finding). Forward gaps need nothing: time eviction and the
+            // accum cutoff already handle them.
+            // The default(DateTime) check is load-bearing: MinValue.AddSeconds(-2) THROWS
+            // (verified against the runtime) and this line runs before every other guard.
+            if (_lastDetectorTime != default(DateTime) && e.Time < _lastDetectorTime.AddSeconds(-2))
+            {
+                lock (_clusterMemLock) _recentClusters.Clear();
+                _srWindow.Clear(); _srMax.Clear(); _srMin.Clear(); _srVolSum = 0;
+            }
+            if (e.Time > _lastDetectorTime)
+                _lastDetectorTime = e.Time;
+
             if (_bid <= 0 || _ask <= 0)
                 return; // inside market not established yet
 
@@ -506,6 +559,11 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 return;
             }
             _recorder?.OnLast(e.Time, e.Price, e.Volume, isBuy ? 1 : -1, _bid, _ask);
+
+            // Stop-run detector (auto mode). Aggressor prints only: during a flush every
+            // print is at bid/ask, so inside-spread prints never extend the range.
+            if (_recorder != null && RecorderAutoMode && StopRunTicks > 0)
+                CheckStopRun(e.Time, e.Price, e.Volume);
 
             // AI Advisor session stats — same thread as all other Last-print handling.
             _cumDelta += isBuy ? e.Volume : -e.Volume;
@@ -588,10 +646,37 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             // Gated on recorder state (not just non-null) so the bar/session serializers below
             // aren't built and thrown away on every cluster while the recorder sits Off.
             if (!bestEffort && _recorder != null && _recorder.State != BigPrintsRecorder.RecorderState.Off)
-                _recorder.OnClusterTrigger(_clusterMaxTime, _clusterIsBuy, _clusterPrice,
-                    _clusterMaxPrint, _clusterVolume, _clusterPrintCount,
+            {
+                _recorder.OnTrigger("sweep", _clusterMaxTime, _clusterIsBuy, _clusterPrice,
+                    _clusterMaxPrint, _clusterVolume, _clusterPrintCount, 0,
                     _clusterStartTime, _clusterLastTime,
                     Instrument.FullName, SerializeRecentBars(10), SerializeSessionStats());
+
+                // Accumulation detector (auto mode): N same-side clusters >= MinVolume
+                // inside the rolling window -> "accum" trigger. The cluster just finalized
+                // is already in _recentClusters. n_prints carries the CLUSTER count here;
+                // max_print fields carry the largest cluster of the window.
+                if (RecorderAutoMode && AccumMinClusters > 0)
+                {
+                    int n = 0; long sum = 0, maxV = 0; double maxP = _clusterPrice;
+                    DateTime oldest = _clusterMaxTime;
+                    lock (_clusterMemLock)
+                    {
+                        DateTime cutoff = _clusterLastTime.AddSeconds(-AccumWindowSec);
+                        foreach (ClusterRecord c in _recentClusters)
+                        {
+                            if (c.IsBuy != _clusterIsBuy || c.Time < cutoff) continue;
+                            n++; sum += c.Volume;
+                            if (c.Time < oldest) oldest = c.Time;
+                            if (c.Volume > maxV) { maxV = c.Volume; maxP = c.Price; }
+                        }
+                    }
+                    if (n >= AccumMinClusters)
+                        _recorder.OnTrigger("accum", _clusterMaxTime, _clusterIsBuy, maxP, maxV,
+                            sum, n, 0, oldest, _clusterLastTime,
+                            Instrument.FullName, SerializeRecentBars(10), SerializeSessionStats());
+                }
+            }
 
             _tagCounter++;
             string dotTag  = "BigPrintDot"  + _tagCounter;
@@ -691,6 +776,45 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
             }
         }
 
+        // ---- Stop-run detector (auto mode) --------------------------------------------
+        // Rolling window over aggressor prints; fires when price has traveled
+        // StopRunTicks within StopRunWindowSec AND the current print is the leading
+        // edge of the move (window max above for a down run / min below for an up run).
+        // Monotonic deques give O(1) amortized max/min; time-based eviction keeps them
+        // consistent with the window queue. Cleared on fire so one flush = one trigger.
+        private void CheckStopRun(DateTime t, double price, long size)
+        {
+            DateTime cutoff = t.AddSeconds(-StopRunWindowSec);
+            while (_srWindow.Count > 0 && _srWindow.Peek().T < cutoff)
+                _srVolSum -= _srWindow.Dequeue().V;
+            while (_srMax.Count > 0 && _srMax.First.Value.T < cutoff) _srMax.RemoveFirst();
+            while (_srMin.Count > 0 && _srMin.First.Value.T < cutoff) _srMin.RemoveFirst();
+
+            while (_srMax.Count > 0 && _srMax.Last.Value.P <= price) _srMax.RemoveLast();
+            _srMax.AddLast(new SrPrint { T = t, P = price });
+            while (_srMin.Count > 0 && _srMin.Last.Value.P >= price) _srMin.RemoveLast();
+            _srMin.AddLast(new SrPrint { T = t, P = price });
+            _srWindow.Enqueue(new SrPrint { T = t, P = price, V = size });
+            _srVolSum += size;
+
+            double range = StopRunTicks * TickSize;
+            double hi = _srMax.First.Value.P, lo = _srMin.First.Value.P;
+            bool down = hi - price >= range;    // current print at the low edge of a flush
+            bool up   = price - lo >= range;
+            if (down && up) { if (hi - price >= price - lo) up = false; else down = false; }
+            if (!down && !up)
+                return;
+
+            DateTime tStart = _srWindow.Peek().T;
+            int  nPrints    = _srWindow.Count;
+            long vol        = _srVolSum;
+            int  rangeTicks = (int)Math.Round((down ? hi - price : price - lo) / TickSize);
+            _srWindow.Clear(); _srMax.Clear(); _srMin.Clear(); _srVolSum = 0;
+
+            _recorder.OnTrigger("stoprun", t, up, price, size, vol, nPrints, rangeTicks,
+                tStart, t, Instrument.FullName, SerializeRecentBars(10), SerializeSessionStats());
+        }
+
         // ---- Event Recorder UX --------------------------------------------------------
 
         private void OnRecordClick(object sender, RoutedEventArgs e)
@@ -714,7 +838,8 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
                 switch (state)
                 {
                     case BigPrintsRecorder.RecorderState.Armed:
-                        _recordButton.Content = "ARMED…"; _recordButton.Background = Brushes.DarkGoldenrod; break;
+                        _recordButton.Content = RecorderAutoMode ? "AUTO…" : "ARMED…";
+                        _recordButton.Background = Brushes.DarkGoldenrod; break;
                     case BigPrintsRecorder.RecorderState.Recording:
                         _recordButton.Content = "REC…";   _recordButton.Background = Brushes.DarkRed;      break;
                     default:
@@ -1163,8 +1288,41 @@ Trading style: intraday only, one position at a time, structure-based stops, no 
         public bool ShowFullAnalysis { get; set; }
 
         [NinjaScriptProperty]
-        [Display(Name = "Enable Recorder", Description = "Adds a Record button: arm it before an expected big print; the next cluster >= Min Volume is captured (tape + inside sizes + L2 snapshots, 120s post) to one JSON under BigPrintsAI/recordings. Playback tool.", Order = 40, GroupName = "Recorder")]
+        [Display(Name = "Enable Recorder", Description = "Adds a Record button: captures tape + inside sizes + L2 snapshots around big-print events (180s post, extended while new triggers land, 10 min cap) to JSON under BigPrintsAI/recordings. Playback tool.", Order = 40, GroupName = "Recorder")]
         public bool EnableRecorder { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Auto Mode", Description = "The recorder arms itself and captures every trigger without clicking Record: sweep clusters (toggle below), same-side accumulations and stop-run flushes. Off = manual v1 behavior (arm by click, one file per click).", Order = 41, GroupName = "Recorder")]
+        public bool RecorderAutoMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Auto: Capture Sweeps", Description = "Auto mode: every cluster >= Min Volume starts a capture (the denominator the pair audit asked for). Off = only accumulation / stop-run triggers start files; sweeps still get logged inside open recordings.", Order = 42, GroupName = "Recorder")]
+        public bool AutoTriggerSweeps { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 20)]
+        [Display(Name = "Auto: Accumulation Clusters", Description = "Auto mode: this many same-side clusters >= Min Volume within the accumulation window fire an 'accum' trigger (0 = off). Targets the observed pattern: repeated big sells, then the drop.", Order = 43, GroupName = "Recorder")]
+        public int AccumMinClusters { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(10, 900)]
+        [Display(Name = "Auto: Accumulation Window (s)", Description = "Rolling window for the accumulation trigger.", Order = 44, GroupName = "Recorder")]
+        public int AccumWindowSec { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(0, 400)]
+        [Display(Name = "Auto: Stop-Run Ticks", Description = "Auto mode: price traveling this many ticks within the stop-run window, with the current print at the leading edge, fires a 'stoprun' trigger (0 = off).", Order = 45, GroupName = "Recorder")]
+        public int StopRunTicks { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 120)]
+        [Display(Name = "Auto: Stop-Run Window (s)", Description = "Rolling window for the stop-run trigger.", Order = 46, GroupName = "Recorder")]
+        public int StopRunWindowSec { get; set; }
+
+        [NinjaScriptProperty]
+        [Range(1, 500)]
+        [Display(Name = "Auto: Max Files Per Session", Description = "Disk guard: auto mode stops capturing after this many files (one log line in the output window).", Order = 47, GroupName = "Recorder")]
+        public int AutoMaxFilesPerSession { get; set; }
         #endregion
     }
 }
