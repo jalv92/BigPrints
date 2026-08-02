@@ -213,13 +213,16 @@ namespace NinjaTrader.NinjaScript.Strategies
         // gates + ATR brackets + trail/BE machinery; no new order code) via the one-slot
         // volatile queue below — same payload-before-flag pattern as _decisionQueued.
         private FailedRetestLongDetector _frl;
-        private class FrlSignal { public DateTime Time; public long Volume; }
+        private class SetupSignal { public DateTime Time; public long Volume; public bool IsBuy; }
         private volatile bool _frlSignalQueued;
-        private FrlSignal _frlSignal;
+        private SetupSignal _frlSignal;
 
-        // UE "Unsponsored Extreme" (batch-8 registration) — LOG-ONLY until its
-        // pre-registered 10-session gate passes; Trade is refused at startup.
+        // UE "Unsponsored Extreme" (batch-8 registration). Trade mode is a Javier
+        // override (2026-08-02, Playback observation) — the 10-session gate has NOT
+        // passed and keeps scoring in parallel from the detector's own logged outcomes.
         private UnsponsoredExtremeDetector _ue;
+        private volatile bool _ueSignalQueued;
+        private SetupSignal _ueSignal;
         private long   _clusterMaxPrint;   // largest single print in the open cluster
         private int    _clusterPrintCount;
         private double _clusterExtreme;    // lowest price in a sell cluster / highest in a buy
@@ -407,6 +410,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 _frlSignalQueued = false;
                 _frlSignal = null;
+                _ueSignalQueued = false;
+                _ueSignal = null;
                 if (FailedRetestMode != BigPrintsSetupMode.Off)
                 {
                     _frl = new FailedRetestLongDetector(TickSize, Instrument.FullName)
@@ -415,22 +420,27 @@ namespace NinjaTrader.NinjaScript.Strategies
                     };
                     _frl.OnSignal = (t, entry, stop, vol) =>
                     {
-                        _frlSignal = new FrlSignal { Time = t, Volume = vol }; // payload before flag
+                        _frlSignal = new SetupSignal { Time = t, Volume = vol, IsBuy = true }; // payload before flag
                         _frlSignalQueued = true;
                     };
                 }
                 if (UeMode != BigPrintsSetupMode.Off)
                 {
                     if (UeMode == BigPrintsSetupMode.Trade)
-                        Print("[BigPrints] UE: Trade mode REFUSED — the pre-registered 10-session gate has not passed. Running LogOnly.");
+                        Print("[BigPrints] UE: Trade mode ON by explicit override (2026-08-02) — the 10-session "
+                            + "gate has NOT passed; trades are Playback observation, the gate keeps scoring in parallel.");
                     _ue = new UnsponsoredExtremeDetector(TickSize, Instrument.FullName)
                     {
                         Log = msg => Print(msg),
                     };
+                    _ue.OnSignal = (t, isLong, entry, vol) =>
+                    {
+                        _ueSignal = new SetupSignal { Time = t, Volume = vol, IsBuy = isLong }; // payload before flag
+                        _ueSignalQueued = true;
+                    };
                 }
                 Print(string.Format("[BigPrints] disc=v3/NQ mode={0} session={1:0000}-{2:0000} discLog={3} frl={4} ue={5}",
-                    EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog, FailedRetestMode,
-                    UeMode == BigPrintsSetupMode.Trade ? "LogOnly(gate)" : UeMode.ToString()));
+                    EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog, FailedRetestMode, UeMode));
 
                 // Shared-governor: wipe this account's registry entry so a Playback rewind
                 // (which resets the account) starts clean; instances re-register on their next
@@ -568,13 +578,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (_frlSignalQueued)
             {
                 _frlSignalQueued = false;
-                FrlSignal sig = _frlSignal;
+                SetupSignal sig = _frlSignal;
                 _frlSignal = null;
                 if (sig != null && FailedRetestMode == BigPrintsSetupMode.Trade)
                 {
                     string result = TryEnter(true, sig.Volume, sig.Time);
                     Print("[BigPrints/frl] Trade-mode signal -> " + result);
-                    SetupLog.AppendAction(sig.Time, Instrument.FullName, result);
+                    SetupLog.AppendAction(sig.Time, Instrument.FullName, "failed_retest_long", result);
+                }
+            }
+
+            // UE signals: same routing. Gate override 2026-08-02 (Javier) — trades are for
+            // Playback observation; the gate scoreboard stays the detector's own outcomes.
+            if (_ueSignalQueued)
+            {
+                _ueSignalQueued = false;
+                SetupSignal sig = _ueSignal;
+                _ueSignal = null;
+                if (sig != null && UeMode == BigPrintsSetupMode.Trade)
+                {
+                    string result = TryEnter(sig.IsBuy, sig.Volume, sig.Time);
+                    Print("[BigPrints/ue] Trade-mode signal (" + (sig.IsBuy ? "LONG" : "SHORT") + ") -> " + result);
+                    SetupLog.AppendAction(sig.Time, Instrument.FullName, "unsponsored_extreme", result);
                 }
             }
         }

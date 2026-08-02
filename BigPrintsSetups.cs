@@ -266,6 +266,11 @@ namespace NinjaTrader.NinjaScript.Strategies
         public Action<string> Log = delegate { };
         public bool LoggingEnabled = true;
 
+        // Fired at signal time on the market-data thread: (time, isLong, entry, barVol).
+        // The registered entry is next-bar-open; the strategy's queue-then-drain gets its
+        // fill at the following prints, matching that convention like FRL's routing.
+        public Action<DateTime, bool, double, long> OnSignal = delegate { };
+
         // ---- frozen 2026-08-01 (batch-8 registration; do not tune) -------------------
         private const int    WarmupSec    = 1800;
         private const int    WindowSec    = 900;
@@ -411,7 +416,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (isLong) _lastLongFire = now; else _lastShortFire = now;
 
             double clusterAgo = _lastClusterT != DateTime.MinValue ? (now - _lastClusterT).TotalSeconds : -1;
-            Log(string.Format("[BigPrints/ue] SIGNAL {0} (log-only): entry {1:0.00} | r15 {2:0.00} armA={3} barDelta {4} barVol {5} anPush {6:0.000} extreme {7:0.00}",
+            Log(string.Format("[BigPrints/ue] SIGNAL {0}: entry {1:0.00} | r15 {2:0.00} armA={3} barDelta {4} barVol {5} anPush {6:0.000} extreme {7:0.00}",
                 isLong ? "LONG" : "SHORT", nextOpen, r15, armA, b.Delta, b.Vol, anPush, extreme));
             if (LoggingEnabled)
                 SetupLog.AppendUeSignal(now, _instrument, isLong, nextOpen, h15, l15, r15, armA,
@@ -419,6 +424,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     clusterAgo >= 0 && clusterAgo <= ClusterNoteSec ? (_lastClusterBuy ? "buy" : "sell") : "",
                     clusterAgo >= 0 && clusterAgo <= ClusterNoteSec ? _lastClusterVol : 0,
                     clusterAgo >= 0 && clusterAgo <= ClusterNoteSec ? clusterAgo : -1);
+            OnSignal(now, isLong, nextOpen, b.Vol);
         }
 
         private void UpdateTrack(Track k, DateTime t, double price)
@@ -494,12 +500,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             });
         }
 
-        public static void AppendAction(DateTime signalTs, string instrument, string action)
+        public static void AppendAction(DateTime signalTs, string instrument, string setup, string action)
         {
             Append(new JObject
             {
                 ["type"] = "signal_action",
-                ["setup"] = "failed_retest_long",
+                ["setup"] = setup,
                 ["v"] = 1,
                 ["signal_ts"] = signalTs.ToString("o"),
                 ["instrument"] = instrument,
