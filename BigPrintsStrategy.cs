@@ -216,6 +216,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private class FrlSignal { public DateTime Time; public long Volume; }
         private volatile bool _frlSignalQueued;
         private FrlSignal _frlSignal;
+
+        // UE "Unsponsored Extreme" (batch-8 registration) — LOG-ONLY until its
+        // pre-registered 10-session gate passes; Trade is refused at startup.
+        private UnsponsoredExtremeDetector _ue;
         private long   _clusterMaxPrint;   // largest single print in the open cluster
         private int    _clusterPrintCount;
         private double _clusterExtreme;    // lowest price in a sell cluster / highest in a buy
@@ -334,6 +338,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 EntryMode               = BigPrintsEntryMode.Immediate;
                 EnableDiscriminatorLog  = true;
                 FailedRetestMode        = BigPrintsSetupMode.LogOnly;
+                UeMode                  = BigPrintsSetupMode.LogOnly;
             }
             else if (State == State.Configure)
             {
@@ -414,8 +419,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                         _frlSignalQueued = true;
                     };
                 }
-                Print(string.Format("[BigPrints] disc=v3/NQ mode={0} session={1:0000}-{2:0000} discLog={3} frl={4}",
-                    EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog, FailedRetestMode));
+                if (UeMode != BigPrintsSetupMode.Off)
+                {
+                    if (UeMode == BigPrintsSetupMode.Trade)
+                        Print("[BigPrints] UE: Trade mode REFUSED — the pre-registered 10-session gate has not passed. Running LogOnly.");
+                    _ue = new UnsponsoredExtremeDetector(TickSize, Instrument.FullName)
+                    {
+                        Log = msg => Print(msg),
+                    };
+                }
+                Print(string.Format("[BigPrints] disc=v3/NQ mode={0} session={1:0000}-{2:0000} discLog={3} frl={4} ue={5}",
+                    EntryMode, SessionStart, SessionEnd, EnableDiscriminatorLog, FailedRetestMode,
+                    UeMode == BigPrintsSetupMode.Trade ? "LogOnly(gate)" : UeMode.ToString()));
 
                 // Shared-governor: wipe this account's registry entry so a Playback rewind
                 // (which resets the account) starts clean; instances re-register on their next
@@ -976,6 +991,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     _disc.Reset();
                 }
                 _frl?.Reset(); // session boundary: a leg low must not carry across days
+                _ue?.Reset();
             }
 
             // Freshest tape time, for every event type — used by PollAtmState to timestamp an
@@ -1037,6 +1053,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             _disc?.OnPrint(e.Time, e.Price, e.Volume, isBuy);
             _frl?.OnPrint(e.Time, e.Price, e.Volume, isBuy);
+            _ue?.OnPrint(e.Time, e.Price, e.Volume, isBuy);
 
             if (_clusterOpen &&
                 isBuy == _clusterIsBuy &&
@@ -1100,6 +1117,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (superseded != null && EnableDiscriminatorLog)
                     DiscriminatorLog.AppendTrigger(superseded, EntryMode.ToString(), "superseded");
             }
+            _ue?.NoteCluster(_clusterLastTime, _clusterIsBuy, _clusterVolume); // pre-fire covariate
 
             // Cold signal — the cluster's last print is too far behind "now" to still be
             // actionable. With the tape-clock timeout in OnMarketData now finalizing clusters
@@ -1857,6 +1875,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         [NinjaScriptProperty]
         [Display(Name = "Failed-Retest Setup Mode", Description = "Caso 4: 'failed no-touch retest of the leg low' long setup (audit 2026-08-01). LogOnly (default) = detect + log signals and 600s MFE/MAE outcomes to BigPrintsAI/setup_log.jsonl, never trade. Trade = ALSO enter long via the standard entry path (all gates + ATR brackets + trailing; the setup's structural stop stays in the log for scoring) — meant for Playback evaluation; thresholds are n=1-calibrated and NOT validated for live money. Off = detector disabled.", Order = 3, GroupName = "07. Discriminator Entry")]
         public BigPrintsSetupMode FailedRetestMode { get; set; }
+
+        [NinjaScriptProperty]
+        [Display(Name = "Unsponsored-Extreme Setup Mode", Description = "UE (batch-8 registration, audit 2026-08-01): fade a new 15-min extreme made by a 1s bar whose own delta disagrees with the break, an60-vetoed. LOG-ONLY: signals + both-bracket outcomes to BigPrintsAI/setup_log.jsonl. Trade is REFUSED until the pre-registered 10-session gate passes (PASS: lift >= +0.25 and >= 6/10 sessions positive). Off = detector disabled.", Order = 4, GroupName = "07. Discriminator Entry")]
+        public BigPrintsSetupMode UeMode { get; set; }
         #endregion
     }
 }

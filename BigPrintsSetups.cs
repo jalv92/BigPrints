@@ -253,6 +253,199 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
     }
 
+    // UnsponsoredExtremeDetector v1.0 — "UE": fade a new 900s extreme made by a 1s bar
+    // whose own delta DISAGREES with the break (new high on net selling / new low on net
+    // buying), an60-vetoed. LOG-ONLY: registration and thresholds frozen verbatim in
+    // docs/audits/2026-08-01-batch8-research.md §Decision 3 — the pre-registered
+    // 10-session gate must pass before this ever earns a Trade switch. Same threading
+    // model as the other detectors: fed exclusively from OnMarketData, no locks.
+    // Honest provenance note: found after ~60 parameter cells on 3 quiet days —
+    // the gate is the protection against that search cost. Do not tune.
+    internal class UnsponsoredExtremeDetector
+    {
+        public Action<string> Log = delegate { };
+        public bool LoggingEnabled = true;
+
+        // ---- frozen 2026-08-01 (batch-8 registration; do not tune) -------------------
+        private const int    WarmupSec    = 1800;
+        private const int    WindowSec    = 900;
+        private const long   MinBarVol    = 10;
+        private const double AnVetoMax    = 0.10;  // an60 x push must be BELOW this
+        private const double ArmARangeMax = 120.0; // ARM-A flag only; both arms logged
+        private const int    CooldownSec  = 120;   // same-direction, from last fire
+        private const double Stop1Pts = 20.0, Tgt1Pts = 40.0; // primary bracket
+        private const double Stop2Pts = 15.0, Tgt2Pts = 30.0; // secondary bracket
+        private const int    TrackCapSec = 600;
+        private const int    ClusterNoteSec = 90;
+        private const double BackwardsTolSecs = 2;
+
+        private readonly double _tickSize;
+        private readonly string _instrument;
+        public UnsponsoredExtremeDetector(double tickSize, string instrument) { _tickSize = tickSize; _instrument = instrument; }
+
+        private class Bar { public long Sec; public double High = double.MinValue, Low = double.MaxValue; public long Delta, Vol; }
+        private readonly Queue<Bar> _bars = new Queue<Bar>();
+        private Bar _open;
+
+        private DateTime _firstPrint = DateTime.MinValue;
+        private DateTime _lastSeen   = DateTime.MinValue;
+        private DateTime _lastLongFire  = DateTime.MinValue;
+        private DateTime _lastShortFire = DateTime.MinValue;
+
+        // Most recent BigPrints cluster (>= MinVolume), for the pre-fire covariate.
+        private DateTime _lastClusterT = DateTime.MinValue;
+        private bool _lastClusterBuy;
+        private long _lastClusterVol;
+
+        private class Track
+        {
+            public DateTime SignalTime;
+            public bool     IsLong;
+            public double   Entry;
+            public double   Fav, Adv;              // points
+            public string   Res1, Res2;            // null until resolved: "target"/"stop"
+        }
+        private Track _trackLong, _trackShort;
+
+        public void Reset()
+        {
+            _bars.Clear(); _open = null;
+            _firstPrint = DateTime.MinValue;
+            if (_trackLong  != null) CloseTrack(_trackLong,  _lastSeen, "reset");
+            if (_trackShort != null) CloseTrack(_trackShort, _lastSeen, "reset");
+            _trackLong = null; _trackShort = null;
+            _lastLongFire = DateTime.MinValue; _lastShortFire = DateTime.MinValue;
+            _lastClusterT = DateTime.MinValue;
+            _lastSeen = DateTime.MinValue;
+        }
+
+        public void NoteCluster(DateTime t, bool isBuy, long volume)
+        {
+            _lastClusterT = t; _lastClusterBuy = isBuy; _lastClusterVol = volume;
+        }
+
+        private static long SecOf(DateTime t) { return t.Ticks / TimeSpan.TicksPerSecond; }
+
+        public void OnPrint(DateTime t, double price, long size, bool isBuy)
+        {
+            if (_lastSeen != DateTime.MinValue && t < _lastSeen.AddSeconds(-BackwardsTolSecs))
+            {
+                Log("[BigPrints/ue] tape time jumped backwards — UE state reset.");
+                Reset();
+            }
+            if (t > _lastSeen) _lastSeen = t;
+            if (_firstPrint == DateTime.MinValue) _firstPrint = t;
+
+            long sec = SecOf(t);
+            if (_open != null && sec > _open.Sec)
+            {
+                // The just-closed bar is evaluated against the STRICTLY PRIOR window,
+                // then enqueued. This rolling print is the next bar's open = the entry.
+                EvaluateClosedBar(_open, t, price);
+                _bars.Enqueue(_open);
+                long cutoff = sec - WindowSec - 1;
+                while (_bars.Count > 0 && _bars.Peek().Sec < cutoff) _bars.Dequeue();
+                _open = null;
+            }
+            if (_open == null || _open.Sec != sec)
+            {
+                if (_open != null && sec < _open.Sec) { /* sub-tolerance jitter: fold in */ }
+                else _open = new Bar { Sec = sec };
+            }
+            if (price > _open.High) _open.High = price;
+            if (price < _open.Low)  _open.Low  = price;
+            _open.Delta += isBuy ? size : -size;
+            _open.Vol   += size;
+
+            if (_trackLong  != null) UpdateTrack(_trackLong,  t, price);
+            if (_trackShort != null) UpdateTrack(_trackShort, t, price);
+        }
+
+        private void EvaluateClosedBar(Bar b, DateTime now, double nextOpen)
+        {
+            if (_firstPrint == DateTime.MinValue || (now - _firstPrint).TotalSeconds < WarmupSec)
+                return;
+            if (b.Vol < MinBarVol)
+                return;
+
+            double h15 = double.MinValue, l15 = double.MaxValue;
+            long d60 = 0, v60 = 0;
+            long lo900 = b.Sec - WindowSec, lo60 = b.Sec - 60;
+            int n = 0;
+            foreach (Bar x in _bars)
+            {
+                if (x.Sec < lo900 || x.Sec >= b.Sec) continue;
+                n++;
+                if (x.High > h15) h15 = x.High;
+                if (x.Low  < l15) l15 = x.Low;
+                if (x.Sec > lo60) { d60 += x.Delta; v60 += x.Vol; }
+            }
+            if (n == 0) return;
+            // an60 window is (t-60, t] — the trigger bar itself included (registration).
+            d60 += b.Delta; v60 += b.Vol;
+
+            bool shortCand = b.High > h15;                 // high precedence per registration
+            bool longCand  = !shortCand && b.Low < l15;
+            if (!shortCand && !longCand) return;
+
+            int push = shortCand ? 1 : -1;
+            if (v60 <= 0) return;
+            double anPush = ((double)d60 / v60) * push;
+            if (anPush >= AnVetoMax) return;               // sponsored push — never fade it
+
+            // Unsponsored: the trigger bar's own delta disagrees with the break.
+            if (shortCand && b.Delta >= 0) return;
+            if (longCand  && b.Delta <= 0) return;
+
+            bool isLong = longCand;
+            Track slot = isLong ? _trackLong : _trackShort;
+            DateTime lastFire = isLong ? _lastLongFire : _lastShortFire;
+            if (slot != null) return;                       // one live track per direction
+            if (lastFire != DateTime.MinValue && (now - lastFire).TotalSeconds < CooldownSec) return;
+
+            double r15 = h15 - l15;
+            bool armA = r15 <= ArmARangeMax;
+            double extreme = isLong ? b.Low : b.High;
+            var k = new Track { SignalTime = now, IsLong = isLong, Entry = nextOpen, Fav = 0, Adv = 0 };
+            if (isLong) _trackLong = k; else _trackShort = k;
+            if (isLong) _lastLongFire = now; else _lastShortFire = now;
+
+            double clusterAgo = _lastClusterT != DateTime.MinValue ? (now - _lastClusterT).TotalSeconds : -1;
+            Log(string.Format("[BigPrints/ue] SIGNAL {0} (log-only): entry {1:0.00} | r15 {2:0.00} armA={3} barDelta {4} barVol {5} anPush {6:0.000} extreme {7:0.00}",
+                isLong ? "LONG" : "SHORT", nextOpen, r15, armA, b.Delta, b.Vol, anPush, extreme));
+            if (LoggingEnabled)
+                SetupLog.AppendUeSignal(now, _instrument, isLong, nextOpen, h15, l15, r15, armA,
+                    b.Delta, b.Vol, anPush, Math.Abs(nextOpen - extreme) / _tickSize,
+                    clusterAgo >= 0 && clusterAgo <= ClusterNoteSec ? (_lastClusterBuy ? "buy" : "sell") : "",
+                    clusterAgo >= 0 && clusterAgo <= ClusterNoteSec ? _lastClusterVol : 0,
+                    clusterAgo >= 0 && clusterAgo <= ClusterNoteSec ? clusterAgo : -1);
+        }
+
+        private void UpdateTrack(Track k, DateTime t, double price)
+        {
+            double fav = k.IsLong ? price - k.Entry : k.Entry - price;
+            double adv = -fav;
+            if (fav > k.Fav) k.Fav = fav;
+            if (adv > k.Adv) k.Adv = adv;
+            // First-touch bracket results, tick path, stop-first ordering within a print.
+            if (k.Res1 == null) k.Res1 = adv >= Stop1Pts ? "stop" : (fav >= Tgt1Pts ? "target" : null);
+            if (k.Res2 == null) k.Res2 = adv >= Stop2Pts ? "stop" : (fav >= Tgt2Pts ? "target" : null);
+            if ((t - k.SignalTime).TotalSeconds >= TrackCapSec)
+            {
+                CloseTrack(k, t, "tracked");
+                if (k.IsLong) _trackLong = null; else _trackShort = null;
+            }
+        }
+
+        private void CloseTrack(Track k, DateTime t, string how)
+        {
+            if (!LoggingEnabled) return;
+            SetupLog.AppendUeOutcome(k.SignalTime, _instrument, k.IsLong, how,
+                k.Fav / _tickSize, k.Adv / _tickSize,
+                k.Res1 ?? "cap", k.Res2 ?? "cap", t);
+        }
+    }
+
     // JSONL logger for the setup library — separate file from the discriminator corpus.
     internal static class SetupLog
     {
@@ -311,6 +504,53 @@ namespace NinjaTrader.NinjaScript.Strategies
                 ["signal_ts"] = signalTs.ToString("o"),
                 ["instrument"] = instrument,
                 ["action"] = action, // "entered" or the TryEnter rejection reason; LogOnly never writes this
+            });
+        }
+
+        public static void AppendUeSignal(DateTime ts, string instrument, bool isLong, double entry,
+            double h15, double l15, double r15, bool armA, long barDelta, long barVol, double anPush,
+            double distExtremeTicks, string clusterSide, long clusterVol, double clusterSecsAgo)
+        {
+            Append(new JObject
+            {
+                ["type"] = "signal",
+                ["setup"] = "unsponsored_extreme",
+                ["v"] = 1,
+                ["ts"] = ts.ToString("o"),
+                ["instrument"] = instrument,
+                ["dir"] = isLong ? "long" : "short",
+                ["entry"] = entry,
+                ["h15"] = h15,
+                ["l15"] = l15,
+                ["r15"] = r15,
+                ["arm_a"] = armA,
+                ["bar_delta"] = barDelta,
+                ["bar_vol"] = barVol,
+                ["an_push"] = anPush,
+                ["dist_extreme_ticks"] = distExtremeTicks,
+                ["cluster_side"] = clusterSide,       // most recent cluster <=90s BEFORE the fire; "" = none
+                ["cluster_vol"] = clusterVol,
+                ["cluster_secs_ago"] = clusterSecsAgo, // -1 = none
+            });
+        }
+
+        public static void AppendUeOutcome(DateTime signalTs, string instrument, bool isLong, string how,
+            double mfeTicks, double maeTicks, string res2040, string res1530, DateTime resolvedTs)
+        {
+            Append(new JObject
+            {
+                ["type"] = "signal_outcome",
+                ["setup"] = "unsponsored_extreme",
+                ["v"] = 1,
+                ["signal_ts"] = signalTs.ToString("o"),
+                ["instrument"] = instrument,
+                ["dir"] = isLong ? "long" : "short",
+                ["how"] = how,
+                ["mfe_ticks"] = mfeTicks,
+                ["mae_ticks"] = maeTicks,
+                ["res_20_40"] = res2040,  // target | stop | cap
+                ["res_15_30"] = res1530,
+                ["resolved_ts"] = resolvedTs.ToString("o"),
             });
         }
 
