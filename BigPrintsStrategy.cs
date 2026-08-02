@@ -597,7 +597,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _ueSignal = null;
                 if (sig != null && UeMode == BigPrintsSetupMode.Trade)
                 {
-                    string result = TryEnter(sig.IsBuy, sig.Volume, sig.Time);
+                    string result = TryEnter(sig.IsBuy, sig.Volume, sig.Time, true);
                     Print("[BigPrints/ue] Trade-mode signal (" + (sig.IsBuy ? "LONG" : "SHORT") + ") -> " + result);
                     SetupLog.AppendAction(sig.Time, Instrument.FullName, "unsponsored_extreme", result);
                 }
@@ -1170,7 +1170,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Native mode arms ATR brackets per entry (ArmBrackets) and manages them per tick
         // (ManageTradeStops: breakeven + order-flow trailing). ATM mode gets its stop/target
         // from the template instead (see AtmTemplateName).
-        private string TryEnter(bool isBuy, long volume, DateTime marketTime)
+        // skipCooldown: UE signals bypass the strategy-level entry cooldown (Javier 2026-08-02,
+        // after it blocked the best post-cascade entry on 07-15) — the detector's own 120s
+        // per-direction cooldown still gates them. All other gates apply unchanged.
+        private string TryEnter(bool isBuy, long volume, DateTime marketTime, bool skipCooldown = false)
         {
             if (_orderPending)
             {
@@ -1190,8 +1193,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             return IsAtmMode
-                ? TryEnterAtm(isBuy, volume, marketTime)
-                : TryEnterNative(isBuy, volume, marketTime);
+                ? TryEnterAtm(isBuy, volume, marketTime, skipCooldown)
+                : TryEnterNative(isBuy, volume, marketTime, skipCooldown);
         }
 
         // Cooldown gate — fresh entries from flat ONLY; reversals are exempt (governed by the
@@ -1476,7 +1479,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // managed-approach order (close + open), per NT8's documented Entry() reversal behavior
         // — no separate Exit() call needed. Reversal branches are gated by the aggression-balance
         // filter (feature 2); the flat-entry branch is gated by the cooldown instead (never both).
-        private string TryEnterNative(bool isBuy, long volume, DateTime now)
+        private string TryEnterNative(bool isBuy, long volume, DateTime now, bool skipCooldown = false)
         {
             MarketPosition pos = Position.MarketPosition;
 
@@ -1494,7 +1497,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (pos == MarketPosition.Flat)
             {
-                if (!PassesCooldown(isBuy, volume, now))
+                if (!skipCooldown && !PassesCooldown(isBuy, volume, now))
                     return "cooldown"; // consumed — not queued for later
                 if (!ArmBrackets(isBuy))
                     return "atr_not_ready"; // ATR not warmed up yet
@@ -1538,7 +1541,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // _atmReverseToBuy carries the queued direction across that gap. Reversal branches are
         // gated by the aggression-balance filter (feature 2); the flat-entry branch is gated by
         // the cooldown instead (never both — a reversal is exempt from cooldown by design).
-        private string TryEnterAtm(bool isBuy, long volume, DateTime now)
+        private string TryEnterAtm(bool isBuy, long volume, DateTime now, bool skipCooldown = false)
         {
             MarketPosition atmPos;
             if (string.IsNullOrEmpty(_atmStrategyId))
@@ -1555,7 +1558,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
             if (atmPos == MarketPosition.Flat)
             {
-                if (!PassesCooldown(isBuy, volume, now))
+                if (!skipCooldown && !PassesCooldown(isBuy, volume, now))
                     return "cooldown"; // consumed — not queued for later
 
                 CreateAtm(isBuy);
